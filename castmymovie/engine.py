@@ -1,15 +1,14 @@
-#!/usr/bin/env python3
-"""castready - make a movie file play smoothly in Chrome and cast to a Google TV over 2.4 GHz Wi-Fi.
+"""The engine: probe a movie, decide what Chrome and Google Cast need, convert it, verify it.
 
-    castready movie.mkv
+No user interface in here. The wizard in `ui.py` drives it in three steps:
 
-Probes the file, checks everything Chrome and Google Cast care about, and only
-does the minimum work needed: nothing, a lossless remux, or a capped re-encode.
+    scan(path)                       read the file once (streams + real bitrate profile)
+    analyze(scan, max_mbps, ...)     cheap, can be re-run for every bitrate preset
+    convert(scan, analysis)          remux / re-encode, verify, export subtitles
 """
 
 from __future__ import annotations
 
-import argparse
 import collections
 import json
 import os
@@ -22,11 +21,11 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-
-__version__ = "0.1.0"
+from typing import Callable
 
 # Peak (video + audio, worst 10 s window) a 2.4 GHz link can carry reliably. See README.
 DEFAULT_MAX_MBPS = 6.0
+NO_CAP_MBPS = 1000.0
 WINDOW_S = 10
 PEAK_TOLERANCE = 1.05
 MAX_W, MAX_H = 1920, 1080  # Chrome tab mirroring tops out at 1080p
@@ -54,85 +53,40 @@ class CastError(Exception):
     pass
 
 
-# ---------------------------------------------------------------- output helpers
-
-def _color(code: str, text: str) -> str:
-    if sys.stdout.isatty() and "NO_COLOR" not in os.environ:
-        return f"\033[{code}m{text}\033[0m"
-    return text
+class OutputExists(CastError):
+    def __init__(self, path: Path):
+        super().__init__(f"{path.name} already exists")
+        self.path = path
 
 
-OK, BAD, NOTE = _color("32", "✓"), _color("31", "✗"), _color("33", "!")
+# ---------------------------------------------------------------- progress protocol
 
+class NullProgress:
+    """Does nothing. The UI passes a factory that returns something with the same four members."""
 
-def fmt_dur(seconds: float) -> str:
-    h, rem = divmod(int(max(0, seconds)), 3600)
-    m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-
-
-def fmt_size(nbytes: float) -> str:
-    return f"{nbytes / 1e9:.2f} GB" if nbytes >= 1e9 else f"{nbytes / 1e6:.0f} MB"
-
-
-class Progress:
-    """One-line progress bar with speed and ETA; periodic lines when not a terminal."""
+    extra = ""
 
     def __init__(self, label: str, total: float):
-        self.label, self.total = label, max(total, 1e-9)
-        self.start = time.monotonic()
-        self.samples: collections.deque = collections.deque(maxlen=128)
-        self.tty = sys.stderr.isatty()
-        self.extra = ""
-        self._drawn = 0.0
-        self._logged = -1
+        pass
 
-    def _eta(self, now: float, done: float) -> float | None:
-        recent = [(t, d) for t, d in self.samples if now - t <= 20]
-        if len(recent) >= 2 and now - recent[0][0] >= 2 and done > recent[0][1]:
-            rate = (done - recent[0][1]) / (now - recent[0][0])
-        elif done > 0 and now > self.start:
-            rate = done / (now - self.start)
-        else:
-            return None
-        return (self.total - done) / rate if rate > 0 else None
-
-    def update(self, done: float, final: bool = False) -> None:
-        now = time.monotonic()
-        done = min(done, self.total)
-        self.samples.append((now, done))
-        pct = 100 * done / self.total
-        eta = self._eta(now, done)
-        speed = done / (now - self.start) if now > self.start else 0
-        tail = f"{pct:5.1f}%  {speed:5.1f}x  {fmt_dur(now - self.start)}  ETA {fmt_dur(eta) if eta is not None else '--:--'}"
-        if self.extra:
-            tail += f"  {self.extra}"
-        if self.tty:
-            if not final and now - self._drawn < 0.1:
-                return
-            self._drawn = now
-            cols = shutil.get_terminal_size((100, 20)).columns
-            width = max(10, min(32, cols - len(self.label) - len(tail) - 6))
-            filled = int(width * pct / 100)
-            bar = "█" * filled + "░" * (width - filled)
-            sys.stderr.write(f"\r\033[K{self.label} {bar} {tail}")
-            sys.stderr.flush()
-        elif int(pct // 10) > self._logged or final:
-            self._logged = int(pct // 10)
-            print(f"{self.label} {tail}", file=sys.stderr, flush=True)
+    def update(self, done: float) -> None:
+        pass
 
     def finish(self) -> None:
-        self.update(self.total, final=True)
-        if self.tty:
-            sys.stderr.write("\n")
-            sys.stderr.flush()
+        pass
 
     def abort(self) -> None:
-        if self.tty:
-            sys.stderr.write("\n")
+        pass
+
+
+ProgressFactory = Callable[[str, float], NullProgress]
 
 
 # ---------------------------------------------------------------- probing
+
+def have_ffmpeg() -> bool:
+    return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
 
 def probe(path: Path) -> dict:
     p = subprocess.run(
@@ -183,12 +137,13 @@ class StreamStats:
         return best * 8 / window
 
 
-def scan_bitrates(path: Path, duration: float, label: str = "Analyzing") -> dict:
+def scan_bitrates(path: Path, duration: float, label: str = "Analyzing",
+                  progress: ProgressFactory = NullProgress) -> dict:
     """Read every packet header (no decoding) to get true average and peak bitrates per stream."""
     cmd = ["ffprobe", "-v", "error", "-show_entries", "packet=stream_index,pts_time,dts_time,size",
            "-of", "compact=p=0", str(path)]
     stats: dict = collections.defaultdict(StreamStats)
-    bar = Progress(label, duration)
+    bar = progress(label, duration)
     latest = 0.0
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1 << 20) as proc:
         try:
@@ -259,6 +214,52 @@ def chrome_major() -> int | None:
     return None
 
 
+@dataclass
+class Scan:
+    """Everything we learn from reading the file once. Independent of the bitrate the user picks."""
+    path: Path
+    info: dict
+    stats: dict
+    duration: float
+    chrome: int | None
+
+    @property
+    def video(self) -> dict:
+        for s in self.info["streams"]:
+            if s["codec_type"] == "video" and not s.get("disposition", {}).get("attached_pic"):
+                return s
+        raise CastError("no video stream found")
+
+    @property
+    def audios(self) -> list:
+        return [s for s in self.info["streams"] if s["codec_type"] == "audio"]
+
+    @property
+    def subtitles(self) -> list:
+        return [s for s in self.info["streams"] if s["codec_type"] == "subtitle"]
+
+    def video_peak_bps(self) -> float:
+        st = self.stats.get(self.video["index"])
+        return st.peak_bps() if st else 0.0
+
+    def video_avg_bps(self) -> float:
+        st = self.stats.get(self.video["index"])
+        return st.avg_bps(self.duration) if st else 0.0
+
+
+def scan(path: Path, progress: ProgressFactory = NullProgress) -> Scan:
+    if not have_ffmpeg():
+        raise CastError("ffmpeg not found. Install it first (macOS: brew install ffmpeg).")
+    info = probe(path)
+    duration = float(info["format"].get("duration") or 0)
+    if duration <= 0:
+        raise CastError("could not determine the duration")
+    s = Scan(path, info, {}, duration, chrome_major())
+    s.video  # raises early when there is no video
+    s.stats = scan_bitrates(path, duration, "Analyzing", progress)
+    return s
+
+
 # ---------------------------------------------------------------- analysis
 
 @dataclass
@@ -294,6 +295,25 @@ class Plan:
             return "as-is"
         return "re-encode" if "encode" in (self.video, self.audio) else "remux"
 
+    @property
+    def steps(self) -> list:
+        out = list(self.container_why)
+        if self.video == "encode":
+            out.append("re-encode video: " + ", ".join(self.video_why))
+        if self.audio == "encode":
+            out.append("convert audio to AAC")
+        return out
+
+
+@dataclass
+class Analysis:
+    checks: list
+    plan: Plan
+    max_mbps: float
+    peak: float
+    avg: float
+    audio: dict | None
+
 
 def norm_lang(code: str | None) -> str:
     code = (code or "").lower()
@@ -314,19 +334,12 @@ def pick_audio(audios: list, lang: str | None) -> dict | None:
     return audios[0]
 
 
-def analyze(path: Path, info: dict, stats: dict, max_mbps: float, force_h264: bool,
-            lang: str | None, chrome: int | None) -> tuple[list, Plan, dict]:
-    streams = info["streams"]
-    videos = [s for s in streams if s["codec_type"] == "video" and not s.get("disposition", {}).get("attached_pic")]
-    audios = [s for s in streams if s["codec_type"] == "audio"]
-    subs = [s for s in streams if s["codec_type"] == "subtitle"]
-    if not videos:
-        raise CastError("no video stream found")
-    v = videos[0]
-    a = pick_audio(audios, lang)
-    duration = float(info["format"].get("duration") or v.get("duration") or 0)
-    if duration <= 0:
-        raise CastError("could not determine the duration")
+def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = False,
+            lang: str | None = None, audio_index: int | None = None) -> Analysis:
+    path, info, stats, duration = sc.path, sc.info, sc.stats, sc.duration
+    v, audios, subs = sc.video, sc.audios, sc.subtitles
+    a = next((x for x in audios if x["index"] == audio_index), None) if audio_index is not None \
+        else pick_audio(audios, lang)
 
     plan = Plan(video_idx=v["index"], audio_idx=a["index"] if a else None, fps=fps_of(v) or 24.0)
     checks: list[Check] = []
@@ -355,7 +368,7 @@ def analyze(path: Path, info: dict, stats: dict, max_mbps: float, force_h264: bo
     codec, pix = v["codec_name"], v.get("pix_fmt", "")
     level = int(v.get("level", 0) or 0)
     level = 0 if level < 0 else level
-    hevc_ok = sys.platform == "darwin" and (chrome is None or chrome >= CHROME_MIN_HEVC)
+    hevc_ok = sys.platform == "darwin" and (sc.chrome is None or sc.chrome >= CHROME_MIN_HEVC)
     why: list[str] = []
     if codec == "h264":
         if v.get("profile") not in H264_PROFILES:
@@ -368,7 +381,7 @@ def analyze(path: Path, info: dict, stats: dict, max_mbps: float, force_h264: bo
     elif codec == "hevc":
         detail = f"HEVC {v.get('profile')}, {pix}"
         if force_h264:
-            why.append("--h264 requested (older Chromecast)")
+            why.append("H.264 requested (older Chromecast)")
         elif not hevc_ok:
             why.append("cannot confirm Chrome hardware HEVC decoding on this machine")
         elif pix not in HEVC_PIX_FMTS:
@@ -429,18 +442,18 @@ def analyze(path: Path, info: dict, stats: dict, max_mbps: float, force_h264: bo
             plan.audio_out_kbps = round(astats.avg_bps(duration) / 1000) if astats else 192
         if len(audios) > 1:
             others = ", ".join(f"#{x['index']} {x.get('tags', {}).get('language', 'und')}" for x in audios if x is not a)
-            checks.append(Check("Audio tracks", None, f"{len(audios)} found, using #{a['index']} [{lang_tag}] (ignored: {others}); pick with --lang"))
+            checks.append(Check("Audio tracks", None, f"{len(audios)} found, using #{a['index']} [{lang_tag}] (ignored: {others})"))
 
     # --- bitrate
-    vstats = stats.get(v["index"])
     audio_bps = plan.audio_out_kbps * 1000 if a else 0  # measured when copied, target when re-encoded
-    peak = (vstats.peak_bps() if vstats else 0) + audio_bps
-    avg = (vstats.avg_bps(duration) if vstats else 0) + audio_bps
+    peak = sc.video_peak_bps() + audio_bps
+    avg = sc.video_avg_bps() + audio_bps
     cap = max_mbps * 1e6
     if peak <= cap * PEAK_TOLERANCE:
-        checks.append(Check("Bitrate", True, f"avg {avg / 1e6:.1f} Mbps, peak {peak / 1e6:.1f} Mbps ≤ {max_mbps:g} Mbps ({WINDOW_S} s window)"))
+        limit = "no cap" if max_mbps >= NO_CAP_MBPS else f"≤ {max_mbps:g} Mbps ({WINDOW_S} s window)"
+        checks.append(Check("Bitrate", True, f"avg {avg / 1e6:.1f} Mbps, peak {peak / 1e6:.1f} Mbps {limit}"))
     else:
-        checks.append(Check("Bitrate", False, f"peak {peak / 1e6:.1f} Mbps > {max_mbps:g} Mbps: too much for 2.4 GHz Wi-Fi"))
+        checks.append(Check("Bitrate", False, f"peak {peak / 1e6:.1f} Mbps > {max_mbps:g} Mbps: too much for this Wi-Fi"))
         plan.video_why.append(f"cap bitrate to {max_mbps:g} Mbps")
 
     # --- subtitles
@@ -450,7 +463,7 @@ def analyze(path: Path, info: dict, stats: dict, max_mbps: float, force_h264: bo
         msg = f"{len(text)} text track(s) → .vtt sidecar files"
         if bitmap:
             msg += f"; {len(bitmap)} image-based track(s) cannot be converted"
-        checks.append(Check("Subtitles", None, msg + " (Chrome's file player does not show embedded subtitles)"))
+        checks.append(Check("Subtitles", None, msg))
 
     # --- finalize plan
     plan.video = "encode" if plan.video_why else "copy"
@@ -463,10 +476,15 @@ def analyze(path: Path, info: dict, stats: dict, max_mbps: float, force_h264: bo
     if codec == "hevc" and plan.video == "copy" and v.get("codec_tag_string") == "hev1":
         plan.remux = True
         plan.container_why.append("retag HEVC as hvc1 so Chrome/Apple decoders accept it")
-    return checks, plan, {"duration": duration, "peak": peak, "avg": avg, "subs": subs, "audio": a, "video": v}
+    return Analysis(checks, plan, max_mbps, peak, avg, a)
 
 
 # ---------------------------------------------------------------- doing the work
+
+def output_path(src: Path) -> Path:
+    """<name>.cast.mp4 next to the input. Always differs from the input, which has a single extension."""
+    return src.with_name(f"{src.stem}.cast.mp4")
+
 
 def build_cmd(src: Path, dst: Path, plan: Plan, info: dict, max_mbps: float) -> list:
     v = next(s for s in info["streams"] if s["index"] == plan.video_idx)
@@ -481,7 +499,7 @@ def build_cmd(src: Path, dst: Path, plan: Plan, info: dict, max_mbps: float) -> 
             cmd += ["-tag:v", "hvc1"]
     else:
         # VBV window = 1 s, so any 10 s window carries at most 1.1x maxrate; 0.9 keeps that under the cap
-        vmax = max(500, int(max_mbps * 1000 * 0.9 - plan.audio_out_kbps))
+        vmax = max(500, int(min(max_mbps, 100) * 1000 * 0.9 - plan.audio_out_kbps))
         vf = []
         if plan.deinterlace:
             vf.append("yadif")
@@ -499,8 +517,8 @@ def build_cmd(src: Path, dst: Path, plan: Plan, info: dict, max_mbps: float) -> 
     return cmd
 
 
-def run_ffmpeg(cmd: list, duration: float, label: str) -> None:
-    bar = Progress(label, duration)
+def run_ffmpeg(cmd: list, duration: float, label: str, progress: ProgressFactory = NullProgress) -> None:
+    bar = progress(label, duration)
     with tempfile.TemporaryFile(mode="w+") as errlog, \
             subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errlog, text=True, bufsize=1) as proc:
         try:
@@ -523,7 +541,7 @@ def run_ffmpeg(cmd: list, duration: float, label: str) -> None:
     bar.finish()
 
 
-def export_subtitles(src: Path, base: Path, subs: list, lang: str | None, duration: float) -> list:
+def export_subtitles(src: Path, base: Path, subs: list, lang: str | None = None) -> list:
     """Write text subtitle tracks as <base>.<lang>.vtt next to the video."""
     made, used = [], collections.Counter()
     for s in subs:
@@ -559,8 +577,20 @@ def decode_test(path: Path, duration: float) -> tuple[bool, float, str]:
     return True, worst, ""
 
 
-def verify(out: Path, src_duration: float, plan: Plan, max_mbps: float) -> tuple[list, str, float]:
-    """Re-probe the finished file. Returns (problems, bitrate summary, decode speed in x real-time)."""
+@dataclass
+class Verification:
+    problems: list
+    verdict: str   # e.g. "peak 4.5 Mbps (limit 6)"
+    decode_speed: float  # x real-time
+
+    @property
+    def ok(self) -> bool:
+        return not self.problems
+
+
+def verify(out: Path, src_duration: float, wants_audio: bool, max_mbps: float,
+           progress: ProgressFactory = NullProgress) -> Verification:
+    """Re-probe the finished file: duration, streams, index position, peak bitrate, test decode."""
     info = probe(out)
     problems = []
     got = float(info["format"].get("duration") or 0)
@@ -569,121 +599,77 @@ def verify(out: Path, src_duration: float, plan: Plan, max_mbps: float) -> tuple
     kinds = [s["codec_type"] for s in info["streams"]]
     if "video" not in kinds:
         problems.append("output has no video")
-    if plan.audio != "none" and "audio" not in kinds:
+    if wants_audio and "audio" not in kinds:
         problems.append("output has no audio")
     if not mp4_is_faststart(out):
         problems.append("index is not at the start of the file")
-    stats = scan_bitrates(out, got, "Verifying")
+    stats = scan_bitrates(out, got, "Verifying", progress)
     kind = {s["index"]: s["codec_type"] for s in info["streams"]}
     peak = max((s.peak_bps() for i, s in stats.items() if kind.get(i) == "video"), default=0) \
         + sum(s.avg_bps(got) for i, s in stats.items() if kind.get(i) == "audio")
-    verdict = f"peak {peak / 1e6:.1f} Mbps (limit {max_mbps:g})"
+    limit = "no cap" if max_mbps >= NO_CAP_MBPS else f"limit {max_mbps:g}"
+    verdict = f"peak {peak / 1e6:.1f} Mbps ({limit})"
     if peak > max_mbps * 1e6 * PEAK_TOLERANCE:
         problems.append(verdict + ": above the limit")
     ok, speed, err = decode_test(out, got)
     if not ok:
         problems.append(f"decode test failed: {err}")
-    return problems, verdict, speed
+    return Verification(problems, verdict, speed)
 
 
-# ---------------------------------------------------------------- CLI
-
-def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(
-        prog="castready",
-        description="Make a movie play smoothly in Chrome and cast to a Google TV over 2.4 GHz Wi-Fi.",
-    )
-    ap.add_argument("file", type=Path, help="movie file (mkv, mp4, avi, ...)")
-    ap.add_argument("--max-mbps", type=float, default=DEFAULT_MAX_MBPS, metavar="N",
-                    help=f"peak video+audio bitrate allowed (default {DEFAULT_MAX_MBPS:g}, safe for 2.4 GHz; try 15+ on 5 GHz)")
-    ap.add_argument("--lang", metavar="CODE", help="preferred audio language, also filters subtitle export (e.g. en, fr)")
-    ap.add_argument("--h264", action="store_true", help="never keep HEVC (older Chromecasts without HEVC)")
-    ap.add_argument("--check", action="store_true", help="only report what would be done (exit 2 if work is needed)")
-    ap.add_argument("--force", action="store_true", help="overwrite an existing .cast.mp4")
-    ap.add_argument("--version", action="version", version=f"castready {__version__}")
-    return ap
+@dataclass
+class Outcome:
+    video: Path                       # the file to play
+    converted: bool                   # False when the input was already fine or an existing output was reused
+    verification: Verification | None
+    subtitles: list
+    seconds: float
 
 
-def main(argv: list | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    src: Path = args.file.expanduser().resolve()
-    if not src.is_file():
-        print(f"castready: no such file: {src}", file=sys.stderr)
-        return 1
-    for tool in ("ffmpeg", "ffprobe"):
-        if not shutil.which(tool):
-            print(f"castready: {tool} not found. Install it first (macOS: brew install ffmpeg).", file=sys.stderr)
-            return 1
-    part = None
+def _finish(sc: Scan, an: Analysis, video: Path, converted: bool, started: float,
+            progress: ProgressFactory) -> Outcome:
+    ver = None
+    if video != sc.path:
+        ver = verify(video, sc.duration, an.plan.audio != "none", an.max_mbps, progress)
+    subs = export_subtitles(sc.path, video, sc.subtitles)
+    return Outcome(video, converted, ver, subs, time.monotonic() - started)
+
+
+def convert(sc: Scan, an: Analysis, progress: ProgressFactory = NullProgress, overwrite: bool = False) -> Outcome:
+    """Do the minimum the plan asks for, then verify. Raises OutputExists unless overwrite is set."""
+    started = time.monotonic()
+    plan = an.plan
+    if not plan.changes:
+        return _finish(sc, an, sc.path, False, started, progress)
+    dst = output_path(sc.path)
+    if dst.exists() and not overwrite:
+        raise OutputExists(dst)
+    need = sc.path.stat().st_size if plan.video == "copy" else sc.duration * min(an.max_mbps, 40) * 1e6 / 8 * 1.1
+    free = shutil.disk_usage(dst.parent).free
+    if free < need * 1.05:
+        raise CastError(f"not enough disk space: need ~{fmt_size(need)}, have {fmt_size(free)}")
+    part = dst.with_name(dst.name + ".part")
     try:
-        info = probe(src)
-        duration = float(info["format"].get("duration") or 0)
-        print(f"{src.name}  ({fmt_size(src.stat().st_size)}, {fmt_dur(duration)})\n")
-        stats = scan_bitrates(src, duration)
-        chrome = chrome_major()
-        checks, plan, facts = analyze(src, info, stats, args.max_mbps, args.h264, args.lang, chrome)
-
-        print()
-        for c in checks:
-            print(f"  {OK if c.ok else BAD if c.ok is False else NOTE} {c.name:<13} {c.detail}")
-        print()
-
-        dst = src.with_name(f"{src.stem}.cast.mp4")
-        if dst == src:  # never write over the input
-            dst = src.with_name(f"{src.stem}.v2.mp4")
-        if not plan.changes:
-            print(f"{OK} Ready as-is: nothing to convert.")
-            video_path = src
-        else:
-            steps = plan.container_why + (["re-encode video: " + ", ".join(plan.video_why)] if plan.video == "encode" else []) \
-                + (["convert audio to AAC"] if plan.audio == "encode" else [])
-            print(f"Plan: {plan.mode}  ({'; '.join(steps)})")
-            if plan.video == "copy" and plan.audio != "encode":
-                print("      streams are copied untouched: lossless and takes seconds")
-            if args.check:
-                return 2
-            if dst.exists() and not args.force:
-                print(f"\ncastready: {dst.name} already exists (use --force to overwrite)", file=sys.stderr)
-                return 1
-            need = src.stat().st_size if plan.video == "copy" else duration * args.max_mbps * 1e6 / 8 * 1.1
-            free = shutil.disk_usage(dst.parent).free
-            if free < need * 1.05:
-                raise CastError(f"not enough disk space: need ~{fmt_size(need)}, have {fmt_size(free)}")
-            print()
-            part = dst.with_name(dst.name + ".part")
-            started = time.monotonic()
-            run_ffmpeg(build_cmd(src, part, plan, info, args.max_mbps), duration,
-                       "Encoding " if plan.video == "encode" else "Remuxing ")
-            os.replace(part, dst)
-            part = None
-            print(f"\nDone in {fmt_dur(time.monotonic() - started)}: {dst.name} ({fmt_size(dst.stat().st_size)})")
-            problems, verdict, speed = verify(dst, duration, plan, args.max_mbps)
-            if problems:
-                print(f"\n{BAD} Verification found problems:")
-                for p in problems:
-                    print(f"    - {p}")
-                return 1
-            print(f"{OK} Verified: duration matches, index at front, {verdict}, test decode {speed:.0f}× real-time")
-            video_path = dst
-
-        if args.check:
-            return 0
-        vtts = export_subtitles(src, video_path, facts["subs"], args.lang, duration)
-        for v in vtts:
-            print(f"{OK} Subtitles: {v.name}")
-        print(f"\nReady: {video_path}")
-        print("Cast it: open the file in Chrome, then ⋮ → Cast, save and share → Cast… and pick your TV (use the \"Cast file\" source if offered).")
-        return 0
-    except CastError as e:
-        print(f"\ncastready: {e}", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        print("\ncastready: cancelled", file=sys.stderr)
-        return 130
+        run_ffmpeg(build_cmd(sc.path, part, plan, sc.info, an.max_mbps), sc.duration,
+                   "Encoding" if plan.video == "encode" else "Remuxing", progress)
+        os.replace(part, dst)
     finally:
-        if part is not None:
-            part.unlink(missing_ok=True)
+        part.unlink(missing_ok=True)
+    return _finish(sc, an, dst, True, started, progress)
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+def reuse_existing(sc: Scan, an: Analysis, progress: ProgressFactory = NullProgress) -> Outcome:
+    """Use a previously converted output after checking it is still sound."""
+    return _finish(sc, an, output_path(sc.path), False, time.monotonic(), progress)
+
+
+# ---------------------------------------------------------------- formatting
+
+def fmt_dur(seconds: float) -> str:
+    h, rem = divmod(int(max(0, seconds)), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def fmt_size(nbytes: float) -> str:
+    return f"{nbytes / 1e9:.2f} GB" if nbytes >= 1e9 else f"{nbytes / 1e6:.0f} MB"
