@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from castmymovie import cast, engine, finder, ui  # noqa: E402
+from castmymovie import cast, engine, finder, telemetry, ui  # noqa: E402
 from common import HAVE_FFMPEG, fixtures  # noqa: E402
 
 TV = cast.Receiver("Living Room TV", "192.168.8.63", "MiTV-MOEU0")
@@ -85,13 +85,31 @@ class FakeKeys:
         return self.seq.pop(0) if self.seq else "q"
 
 
-def make_wizard(script, found=(), receivers=(TV,), vlc="/fake/VLC", keys=("q",)):
+class FakeTele:
+    """Stands in for the background telemetry thread: serves a fixed snapshot."""
+
+    def __init__(self, snap):
+        self.latest, self.position, self.started, self.stopped = snap, 0.0, False, False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+
+GOOD = telemetry.Snapshot(tv_state="PLAYING", tv_position=100.0, buffer_s=31.0, delivered_mbps=1.9,
+                          needed_mbps=1.5, retx_pct=0.1, rtt_ms=19.0)
+
+
+def make_wizard(script, found=(), receivers=(TV,), vlc="/fake/VLC", keys=("q",), tele=None):
     out = io.StringIO()
     console = ui.Console(file=out, theme=ui.THEME, width=130, force_terminal=False)
     FakeCaster.instances, FakeCaster.fail = [], False
     discover = receivers if callable(receivers) else (lambda: list(receivers))
     w = ui.Wizard(console=console, prompt=script, keys=FakeKeys(keys), find_videos=lambda: list(found),
-                  discover=discover, find_vlc=lambda: vlc, caster=FakeCaster)
+                  discover=discover, find_vlc=lambda: vlc, caster=FakeCaster,
+                  telemetry=(lambda session, receiver, curve: tele(curve)) if tele else None)
     return w, out
 
 
@@ -123,7 +141,86 @@ class Flow(unittest.TestCase):
         self.assertIn("Casting to Living Room TV", text)
         cs = FakeCaster.instances[0]
         self.assertEqual(cs.args[1:], (TV, self.d / "plain.cast.mp4", 90.0))
-        self.assertEqual(cs.calls, ["pause", ("seek", 30), ("seek", -300), "stop"])
+        self.assertEqual(cs.calls, ["pause", ("seek", 10), ("seek", -120), "stop"])
+
+    def test_every_arrow_key_has_its_step(self):
+        src = self.d / "plain.mkv"
+        script = Script(src, 6.0, True, TV, "", "done", False)
+        w, out = make_wizard(script, found=[found(src)], keys=["left", "right", "down", "up", "q"])
+        w.run()
+        self.assertEqual(FakeCaster.instances[0].calls, [("seek", -10), ("seek", 10), ("seek", -120), ("seek", 120), "stop"])
+        self.assertIn("±10 s", out.getvalue())
+        self.assertIn("±2 min", out.getvalue())
+
+    def test_panel_shows_buffer_estimate_and_link_health(self):
+        src = self.d / "plain.mkv"
+        made = []
+
+        def tele(curve):
+            made.append(curve)
+            return FakeTele(GOOD)
+
+        w, out = make_wizard(Script(src, 6.0, True, TV, "", "done", False), found=[found(src)], tele=tele)
+        w.run()
+        text = out.getvalue()
+        self.assertIn("Buffer", text)
+        self.assertIn("≈ 30 s", text)            # 31 s is rounded to the nearest 5 and flagged as an estimate
+        self.assertIn("(estimate)", text)
+        self.assertIn("comfortable", text)
+        self.assertIn("1.9 Mbps (needs 1.5)", text)
+        self.assertIn("19 ms", text)
+        self.assertIn("0.1% retransmits", text)
+        self.assertIn("● good", text)
+        self.assertTrue(made and len(made[0]) > 3, "the movie's bitrate curve must reach the telemetry")
+
+    def test_panel_tells_the_truth_when_the_tv_is_buffering(self):
+        src = self.d / "plain.mkv"
+        snap = telemetry.Snapshot(tv_state="BUFFERING", buffer_s=2.0, delivered_mbps=0.3, retx_pct=6.0)
+        w, out = make_wizard(Script(src, 6.0, True, TV, "", "done", False), found=[found(src)],
+                             tele=lambda curve: FakeTele(snap))
+        w.run()
+        text = out.getvalue()
+        self.assertIn("buffering…", text)
+        self.assertIn("critical", text)
+        self.assertIn("● poor", text)
+
+    def test_panel_says_refilling_after_a_seek_instead_of_critical(self):
+        src = self.d / "plain.mkv"
+        snap = telemetry.Snapshot(tv_state="PLAYING", buffer_s=2.0, refilling=True, rtt_ms=20.0)
+        w, out = make_wizard(Script(src, 6.0, True, TV, "", "done", False), found=[found(src)],
+                             tele=lambda curve: FakeTele(snap))
+        w.run()
+        text = out.getvalue()
+        self.assertIn("refilling", text)
+        self.assertNotIn("critical", text)
+        self.assertNotIn("● poor", text)
+
+    def test_panel_without_any_readings_says_it_is_measuring(self):
+        src = self.d / "plain.mkv"
+        w, out = make_wizard(Script(src, 6.0, True, TV, "", "done", False), found=[found(src)],
+                             tele=lambda curve: FakeTele(telemetry.Snapshot()))
+        w.run()
+        self.assertIn("Measuring the link", out.getvalue())
+
+    def test_telemetry_is_started_and_always_stopped(self):
+        src = self.d / "plain.mkv"
+        holder = []
+
+        def tele(curve):
+            holder.append(FakeTele(GOOD))
+            return holder[-1]
+
+        w, _ = make_wizard(Script(src, 6.0, True, TV, "", "done", False), found=[found(src)], tele=tele)
+        w.run()
+        self.assertTrue(holder[0].started and holder[0].stopped)
+
+    def test_no_telemetry_for_a_cast_without_a_process(self):
+        # default factory + FakeCaster (no .proc): the panel must still render, just without health rows
+        src = self.d / "plain.mkv"
+        w, out = make_wizard(Script(src, 6.0, True, TV, "", "done", False), found=[found(src)])
+        self.assertEqual(w.run(), 0)
+        self.assertNotIn("Buffer", out.getvalue())
+        self.assertIn("Casting to Living Room TV", out.getvalue())
 
     def test_quality_menu_previews_what_each_choice_will_do(self):
         src = self.d / "burst.mkv"

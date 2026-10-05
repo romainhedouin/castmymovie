@@ -20,6 +20,7 @@ from rich.text import Text
 from rich.theme import Theme
 
 from . import __version__, cast, engine, finder
+from .telemetry import Snapshot, Telemetry
 
 THEME = Theme({"accent": "bold cyan", "ok": "green", "bad": "bold red", "warn": "yellow", "dim": "dim"})
 QSTYLE = questionary.Style([
@@ -121,16 +122,23 @@ class Keys:
         return self.NAMES.get(data, data.decode(errors="ignore").lower())
 
 
+def default_telemetry(session, receiver: cast.Receiver, curve):
+    """Live TV/link/buffer readings for a real VLC session; None for anything without a process."""
+    proc = getattr(session, "proc", None)
+    return Telemetry(proc.pid, receiver.host, curve) if proc is not None else None
+
+
 # ---------------------------------------------------------------- the wizard
 
 class Wizard:
     def __init__(self, console: Console | None = None, prompt: Prompter | None = None, keys=None,
                  find_videos=finder.find_videos, discover=cast.discover, find_vlc=cast.find_vlc,
-                 caster=cast.VlcCast):
+                 caster=cast.VlcCast, telemetry=default_telemetry):
         self.console = console or Console(theme=THEME)
         self.prompt = prompt or Prompter()
         self.keys = keys if keys is not None else (Keys if sys.stdin.isatty() else None)
         self.find_videos, self.discover, self.find_vlc, self.caster = find_videos, discover, find_vlc, caster
+        self.telemetry = telemetry
 
     # --- small helpers
     def bar(self, label: str, total: float) -> RichBar:
@@ -326,7 +334,7 @@ class Wizard:
             if receiver is None:
                 return
             start = self.ask_start()
-            self.cast_to(vlc, receiver, outcome.video, start)
+            self.cast_to(vlc, receiver, outcome.video, start, outcome.curve)
             action = self.prompt.select("What next?", [
                 ("Cast it again", "again"), ("Choose another TV", "tv"), ("Done with this movie", "done")])
             if action == "done":
@@ -362,7 +370,7 @@ class Wizard:
                 return secs
             self.console.print("[warn]Use minutes:seconds or hours:minutes:seconds, for example 1:12:30[/]")
 
-    def cast_to(self, vlc: str, receiver: cast.Receiver, video: Path, start: float) -> bool:
+    def cast_to(self, vlc: str, receiver: cast.Receiver, video: Path, start: float, curve=None) -> bool:
         session = self.caster(vlc, receiver, video, start)
         try:
             with self.console.status(f"[dim]Starting on {escape(receiver.name)}…", spinner="dots"):
@@ -371,36 +379,90 @@ class Wizard:
             session.stop()
             self.error(f"{escape(str(e))}\n\n[dim]Make sure the TV is awake and on the same Wi-Fi as this Mac.[/]")
             return False
+        tele = self.telemetry(session, receiver, curve) if self.telemetry else None
+        if tele:
+            tele.start()
         try:
-            self.live_controls(session, receiver, video)
+            self.live_controls(session, receiver, video, tele)
         finally:
+            if tele:
+                tele.stop()
             session.stop()
         self.console.print(f"[dim]Stopped casting to {escape(receiver.name)}.[/]")
         return True
 
-    def render_cast(self, st: cast.PlayState, receiver: cast.Receiver, video: Path, interactive: bool) -> Panel:
+    def buffer_row(self, snap: Snapshot | None):
+        if snap is None or snap.buffer_s is None:
+            return None
+        secs = snap.buffer_s
+        shown = round(secs) if secs < 10 else int(round(secs / 5) * 5)
+        colour, word = ("green", "comfortable") if secs >= 15 else ("yellow", "low") if secs >= 5 else ("red", "critical")
+        if snap.refilling:
+            colour, word = "cyan", "refilling"
+        bar = ProgressBar(total=60, completed=min(secs, 60), width=24, complete_style=colour, finished_style=colour)
+        row = Table.grid(padding=(0, 1))
+        row.add_row(Text("Buffer", style="dim"), bar,
+                    Text.from_markup(f"≈ {shown} s [dim](estimate)[/] [{colour}]{word}[/]"))
+        return row
+
+    def link_row(self, snap: Snapshot | None):
+        if snap is None:
+            return None
+        parts = []
+        if snap.delivered_mbps is not None:
+            text = f"{snap.delivered_mbps:.1f} Mbps"
+            if snap.needed_mbps:
+                text += f" (needs {snap.needed_mbps:.1f})"
+            parts.append(text)
+        if snap.rtt_ms is not None:
+            parts.append(f"{snap.rtt_ms:.0f} ms")
+        if snap.retx_pct is not None:
+            parts.append(f"{snap.retx_pct:.1f}% retransmits")
+        if not parts:
+            return None
+        dot = {"good": "[ok]● good[/]", "fair": "[warn]● fair[/]", "poor": "[bad]● poor[/]",
+               "refilling": "[cyan]● refilling[/]"}.get(snap.verdict or "", "")
+        row = Table.grid(padding=(0, 1))
+        row.add_row(Text("Link  ", style="dim"), Text.from_markup(" · ".join(parts) + "   " + dot))
+        return row
+
+    def render_cast(self, st: cast.PlayState, receiver: cast.Receiver, video: Path, interactive: bool,
+                    snap: Snapshot | None = None, telemetry_on: bool = False) -> Panel:
         icon = "⏸ " if st.paused else "▶ "
-        status = "[warn]paused[/]" if st.paused else "[warn]buffering…[/]" if st.buffering else "[ok]playing[/]"
+        tv_buffering = snap is not None and snap.tv_state == "BUFFERING" and not st.paused
+        status = ("[warn]paused[/]" if st.paused else "[warn]buffering…[/]" if (st.buffering or tv_buffering)
+                  else "[ok]playing[/]")
         bar = ProgressBar(total=max(st.length, 1), completed=min(st.position, max(st.length, 1)), width=44,
                           complete_style="cyan", finished_style="cyan")
         row = Table.grid(padding=(0, 1))
         row.add_row(Text(icon + engine.fmt_dur(st.position), style="bold"), bar,
                     Text(engine.fmt_dur(st.length), style="dim"))
-        help_ = "[dim]space[/] pause   [dim]←/→[/] ±30 s   [dim]↑/↓[/] ±5 min   [dim]q[/] stop" if interactive \
+        help_ = "[dim]space[/] pause   [dim]←/→[/] ±10 s   [dim]↑/↓[/] ±2 min   [dim]q[/] stop" if interactive \
             else "[dim]Press Ctrl-C to stop[/]"
-        return Panel(Group(Text(video.name, style="bold"), "", row, "", f"{status}   {help_}"),
-                     title=f"[accent]Casting to {escape(receiver.name)}", border_style="cyan", expand=False)
+        parts = [Text(video.name, style="bold"), "", row, ""]
+        health = [r for r in (self.buffer_row(snap), self.link_row(snap)) if r is not None]
+        if health:
+            parts += health + [""]
+        elif telemetry_on:
+            parts += [Text.from_markup("[dim]Measuring the link…[/]"), ""]
+        parts.append(Text.from_markup(f"{status}   {help_}"))
+        return Panel(Group(*parts), title=f"[accent]Casting to {escape(receiver.name)}", border_style="cyan",
+                     expand=False)
 
-    def live_controls(self, session, receiver: cast.Receiver, video: Path) -> None:
+    def live_controls(self, session, receiver: cast.Receiver, video: Path, tele=None) -> None:
         interactive = self.keys is not None
         keys_cm = self.keys() if interactive else None
+        steps = {"left": -10, "right": 10, "down": -120, "up": 120}
         with Live(console=self.console, refresh_per_second=4, transient=False) as live:
             if keys_cm:
                 keys_cm.__enter__()
             try:
                 while True:
                     st = session.state()
-                    live.update(self.render_cast(st, receiver, video, interactive))
+                    if tele:
+                        tele.position = st.position
+                    live.update(self.render_cast(st, receiver, video, interactive,
+                                                 tele.latest if tele else None, telemetry_on=tele is not None))
                     if not st.alive:
                         return
                     key = keys_cm.read(0.5) if keys_cm else time.sleep(0.5)
@@ -408,14 +470,8 @@ class Wizard:
                         return
                     if key == "space":
                         session.toggle_pause()
-                    elif key == "left":
-                        session.seek_by(-30)
-                    elif key == "right":
-                        session.seek_by(30)
-                    elif key == "down":
-                        session.seek_by(-300)
-                    elif key == "up":
-                        session.seek_by(300)
+                    elif key in steps:
+                        session.seek_by(steps[key])
             finally:
                 if keys_cm:
                     keys_cm.__exit__(None, None, None)

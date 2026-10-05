@@ -124,6 +124,15 @@ class EndToEnd(unittest.TestCase):
         uncapped = engine.analyze(sc, engine.NO_CAP_MBPS)
         self.assertEqual(uncapped.plan.video, "copy")  # only the MKV container needs fixing
 
+    def test_outcome_carries_the_bitrate_curve(self):
+        sc, an, out = pipeline(self.d / "plain.mkv")
+        curve = out.curve
+        self.assertGreaterEqual(len(curve), int(sc.duration))
+        self.assertTrue(all(b >= a for a, b in zip(curve, curve[1:])), "cumulative means never decreasing")
+        self.assertAlmostEqual(curve[-1], out.video.stat().st_size, delta=out.video.stat().st_size * 0.1)
+        sc, an, out = pipeline(self.d / "good.mp4")                      # as-is files get a curve too
+        self.assertGreater(out.curve[-1], 0)
+
     def test_presets_change_the_plan(self):
         sc = engine.scan(self.d / "burst.mkv")
         modes = {m: engine.analyze(sc, m).plan.mode for m in (6.0, 10.0, engine.NO_CAP_MBPS)}

@@ -577,11 +577,22 @@ def decode_test(path: Path, duration: float) -> tuple[bool, float, str]:
     return True, worst, ""
 
 
+def cumulative_curve(stats: dict, duration: float) -> list:
+    """Cumulative bytes of all streams per second of media: curve[t] = bytes needed to play up to second t."""
+    n = int(duration) + 2
+    curve, total = [0], 0
+    for i in range(n):
+        total += sum(s.bins[i] if i < len(s.bins) else 0 for s in stats.values())
+        curve.append(total)
+    return curve
+
+
 @dataclass
 class Verification:
     problems: list
     verdict: str   # e.g. "peak 4.5 Mbps (limit 6)"
     decode_speed: float  # x real-time
+    curve: list | None = None  # cumulative bitrate curve of the verified file
 
     @property
     def ok(self) -> bool:
@@ -614,7 +625,7 @@ def verify(out: Path, src_duration: float, wants_audio: bool, max_mbps: float,
     ok, speed, err = decode_test(out, got)
     if not ok:
         problems.append(f"decode test failed: {err}")
-    return Verification(problems, verdict, speed)
+    return Verification(problems, verdict, speed, cumulative_curve(stats, got))
 
 
 @dataclass
@@ -624,6 +635,7 @@ class Outcome:
     verification: Verification | None
     subtitles: list
     seconds: float
+    curve: list | None = None         # cumulative bitrate curve of `video`, for the live buffer estimate
 
 
 def _finish(sc: Scan, an: Analysis, video: Path, converted: bool, started: float,
@@ -631,8 +643,9 @@ def _finish(sc: Scan, an: Analysis, video: Path, converted: bool, started: float
     ver = None
     if video != sc.path:
         ver = verify(video, sc.duration, an.plan.audio != "none", an.max_mbps, progress)
+    curve = ver.curve if ver else cumulative_curve(sc.stats, sc.duration)
     subs = export_subtitles(sc.path, video, sc.subtitles)
-    return Outcome(video, converted, ver, subs, time.monotonic() - started)
+    return Outcome(video, converted, ver, subs, time.monotonic() - started, curve)
 
 
 def convert(sc: Scan, an: Analysis, progress: ProgressFactory = NullProgress, overwrite: bool = False) -> Outcome:

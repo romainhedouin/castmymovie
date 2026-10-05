@@ -39,11 +39,16 @@ castmymovie
 ❯ Which TV?
  ❯ Living Room TV  (Chromecast, 192.168.1.20)
 
-╭──────────────── Casting to Living Room TV ─────────────────╮
-│ clip.cast.mp4                                              │
-│ ▶ 01:07 ━━━━━━━━━━━━━━━━╺━━━━━━━━━━━━━━━━━━━━━━━━━━━ 03:01 │
-│ playing   space pause   ←/→ ±30 s   ↑/↓ ±5 min   q stop    │
-╰────────────────────────────────────────────────────────────╯
+╭────────────────────── Casting to Living Room TV ──────────────────────╮
+│ My Movie 2020 1080p HEVC 5.1.cast.mp4                                 │
+│                                                                       │
+│ ▶ 50:41 ━━━━━━━━━━━━━━╺━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2:34:45          │
+│                                                                       │
+│ Buffer ━━━━━━━━━━━━━━━━━━━━━━╺━ ≈ 55 s (estimate) comfortable         │
+│ Link   1.0 Mbps (needs 0.7) · 16 ms · 0.1% retransmits   ● good       │
+│                                                                       │
+│ playing   space pause   ←/→ ±10 s   ↑/↓ ±2 min   q stop               │
+╰───────────────────────────────────────────────────────────────────────╯
 ```
 
 ## Install
@@ -71,7 +76,8 @@ Prefer pipx? `pipx install .` works too.
 4. **Converts and verifies.** Progress bar with speed and ETA. It re-probes the result: duration, streams,
    index position, peak bitrate, a test decode. Ctrl-C stops cleanly and leaves no partial file.
 5. **Casts it.** It finds your TVs on the network, asks where to start (`1:12:30`, or Enter for the
-   beginning), and plays through VLC with live controls.
+   beginning), and plays through VLC with a live panel: position, buffer, link health, and keys
+   (space pause, ←/→ ±10 s, ↑/↓ ±2 min, q stop).
 
 The converted file is saved next to the original as `<name>.cast.mp4` (the original is never touched) and
 also plays in Chrome. Text subtitles are saved next to it as `.vtt` files.
@@ -87,6 +93,37 @@ untouched (HEVC stays HEVC); only the audio is converted on the fly.
 
 VLC runs without a window and castmymovie drives it through VLC's remote-control interface, which is
 where the pause, seek and position bar come from.
+
+## Reading the player
+
+| Row | What it tells you |
+|---|---|
+| `▶ 50:41 ━━ 2:34:45` | Position and length. VLC's clock tracks the TV to within about a second. |
+| `playing` / `paused` / `buffering…` | The TV's own state. `buffering…` comes straight from the TV, so it is exact. |
+| `Buffer ≈ 55 s (estimate)` | Roughly how many seconds the TV has downloaded ahead of what it is showing. |
+| `Link 1.0 Mbps (needs 0.7) · 16 ms · 0.1% retransmits` | Over the last 30 s: data delivered vs what the movie needs, round-trip time, and the share of data that had to be re-sent. |
+| `● good / fair / poor / refilling` | One-word verdict. `refilling` means a seek just emptied the buffer, which is normal. |
+
+**The buffer figure is an estimate, good to roughly ±10 s and sometimes worse.** A Cast TV never says how much it has buffered
+(its status messages carry only position and state), so castmymovie infers it: the bytes sent to the TV
+are converted to media time using the movie's real bitrate profile, minus where the TV is now. That
+conversion is not exact (VLC re-muxes the stream and converts the audio), so the number is smoothed,
+rounded, and re-anchored whenever the truth is known: at a stall the buffer is empty, and after a seek the
+TV starts filling from scratch. Against a real Xiaomi Google TV it showed a believable sawtooth (draining
+about 1 s per second, jumping each time the TV pulled a chunk) and stayed flat while paused. Over a 5 minute
+run it stayed in a plausible 20-50 s band without runaway drift, but its low points moved by 20 s or more
+between scenes, partly the estimate and partly the TV's own behaviour, which I could not separate.
+
+Two things that look odd but are right: the buffer can read 50+ s in a quiet, low-bitrate scene because the
+TV prefetches a fixed amount of *data* (about 6 MB), not a fixed number of seconds; and "delivered" can
+sit well below "needs" for a few seconds because the TV pulls in bursts, which is why it is averaged over 30 s.
+
+The TV's state and position come from a small read-only Cast client built in (`castlink.py`): it connects as a
+second sender, the way the Google Home app does, and only ever sends status requests and heartbeats. It never
+launches anything or sends playback commands (a test enforces this). Cast devices use self-signed
+certificates, so this connection does not verify the TV's certificate; it only talks to your own LAN.
+Link statistics come from the operating system's TCP counters (`nettop`) and are **macOS only**: elsewhere
+the Link row is simply left out.
 
 ## Choosing the quality
 
@@ -155,7 +192,7 @@ address…* (your router's device list shows it). macOS may ask Terminal for loc
 **Stutters or buffers a lot.** Your Wi-Fi to the TV is the weak link, not the file. In order of impact:
 move the TV to 5 GHz if the router allows it; set a fixed 2.4 GHz channel (1, 6 or 11) instead of Auto; put
 the Mac on 5 GHz or Ethernet so the video does not cross the same congested band twice; pick *Weak Wi-Fi*.
-The panel shows *buffering…* when the TV stalls. A quick check from the terminal is
+The panel shows *buffering…* when the TV stalls, and the Link row shows the retransmit rate. A quick check from the terminal is
 `ping <tv-ip>`: healthy is under 10 ms with no loss.
 
 **Nothing plays.** The terminal shows a message and VLC's log is kept at `$TMPDIR/castmymovie-vlc.log`.
@@ -167,6 +204,7 @@ The panel shows *buffering…* when the TV stalls. A quick check from the termin
 - HDR sources are flagged, not tone-mapped. Image-based subtitles (PGS/VobSub) can't be converted.
 - One video stream and one audio track are kept (you are asked when there are several).
 - HEVC is only kept on macOS; elsewhere it is re-encoded to H.264 to be safe.
+- The buffer figure is an estimate (about ±10 s, sometimes more) and the Link row is macOS only.
 - Tested against a Xiaomi Google TV; other Cast receivers should work but are untested.
 
 ## Development
@@ -175,9 +213,10 @@ The panel shows *buffering…* when the TV stalls. A quick check from the termin
 python3 -m venv .venv && .venv/bin/pip install -e . && .venv/bin/python -m unittest discover -s tests
 ```
 
-54 tests, around 45 s. They build tiny synthetic clips with ffmpeg and cover every decision path,
-the VLC controller (against a fake VLC speaking the real rc protocol) and the whole wizard (with scripted
-prompts and a fake caster).
+100+ tests, around 1 minute. They build tiny synthetic clips with ffmpeg and cover every decision path,
+the VLC controller (against a fake VLC speaking the real rc protocol), the Cast status client (including
+frames captured byte-for-byte from a real TV), the buffer and link maths, and the whole wizard (with
+scripted prompts and a fake caster).
 
 ## License
 
