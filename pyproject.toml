@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "castready"
+version = "0.1.0"
+description = "Make a movie file play smoothly in Chrome and cast to a Google TV, even over 2.4 GHz Wi-Fi."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["ffmpeg", "chromecast", "google-tv", "remux", "video"]
+
+[project.scripts]
+castready = "castready:main"
+
+[tool.setuptools]
+py-modules = ["castready"]
