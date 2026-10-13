@@ -29,7 +29,7 @@ QSTYLE = questionary.Style([
     ("instruction", "fg:#808080"), ("text", ""), ("hint", "fg:#808080"),
 ])
 
-# name, peak Mbps allowed, who it is for
+# name, peak Mbit/s allowed, who it is for
 PRESETS = [
     ("Weak Wi-Fi", engine.DEFAULT_MAX_MBPS, "2.4 GHz or far from the router (safest)"),
     ("Good Wi-Fi", 10.0, "5 GHz in the same room"),
@@ -264,7 +264,7 @@ class Wizard:
         t.add_row("Video", f"{v['codec_name'].upper()} {v.get('width')}×{v.get('height')}  {engine.fps_of(v):.3g} fps")
         if a:
             t.add_row("Audio", escape(f"{a['codec_name'].upper()} {a.get('channel_layout', '')}  [{a.get('tags', {}).get('language', 'und')}]"))
-        t.add_row("Bitrate", f"average {sc.video_avg_bps() / 1e6:.1f} Mbps, [bold]peak {sc.video_peak_bps() / 1e6:.1f} Mbps[/]")
+        t.add_row("Bitrate", f"average {sc.video_avg_bps() / 1e6:.1f} Mbit/s, [bold]peak {sc.video_peak_bps() / 1e6:.1f} Mbit/s[/]")
         self.console.print()
         self.console.print(Panel(t, border_style="dim", expand=False))
 
@@ -275,13 +275,13 @@ class Wizard:
         choices = []
         for name, mbps, who in PRESETS:
             an = engine.analyze(sc, mbps, audio_index=audio_index)
-            limit = "no cap" if mbps >= engine.NO_CAP_MBPS else f"{mbps:g} Mbps"
-            choices.append((f"{name:<12}{limit:<8} {self.preview(an):<17} {who}", mbps))
+            limit = "no cap" if mbps >= engine.NO_CAP_MBPS else f"{mbps:g} Mbit/s"
+            choices.append((f"{name:<12}{limit:<10} {self.preview(an):<17} {who}", mbps))
         choices.append(("Custom…", "custom"))
         pick = self.prompt.select("How good is the Wi-Fi to your TV?", choices, default=PRESETS[0][1])
         if pick == "custom":
             while True:
-                raw = self.prompt.text("Maximum peak bitrate in Mbps:", default="8")
+                raw = self.prompt.text("Maximum peak bitrate in Mbit/s:", default="8")
                 try:
                     pick = float(raw)
                     if pick > 0:
@@ -410,7 +410,7 @@ class Wizard:
             return None
         parts = []
         if snap.delivered_mbps is not None:
-            text = f"{snap.delivered_mbps:.1f} Mbps"
+            text = f"{snap.delivered_mbps:.1f} Mbit/s"
             if snap.needed_mbps:
                 text += f" (needs {snap.needed_mbps:.1f})"
             parts.append(text)

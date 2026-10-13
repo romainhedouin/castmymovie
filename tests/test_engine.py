@@ -117,7 +117,7 @@ class EndToEnd(unittest.TestCase):
         self.assertGreater(sc.video_peak_bps(), 6e6, "fixture should exceed the cap")
         capped = engine.analyze(sc, 6.0)
         self.assertEqual(capped.plan.video, "encode")
-        self.assertIn("cap bitrate to 6 Mbps", capped.plan.video_why)
+        self.assertIn("cap bitrate to 6 Mbit/s", capped.plan.video_why)
         out = engine.convert(sc, capped)
         new = engine.scan_bitrates(out.video, sc.duration)
         self.assertLessEqual(new[0].peak_bps(), 6e6 * engine.PEAK_TOLERANCE)

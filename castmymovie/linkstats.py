@@ -84,7 +84,7 @@ def read_sample(pid: int, host: str, run=subprocess.run) -> LinkSample | None:
 class LinkMonitor:
     """Turns raw counters into recent rates."""
 
-    RATE_WINDOW = 30.0   # the TV pulls in bursts, so a short window would swing between 0 and a few Mbps
+    RATE_WINDOW = 30.0   # the TV pulls in bursts, so a short window would swing between 0 and a few Mbit/s
     RETX_WINDOW = 60.0
     MIN_RATE_SPAN = 15.0
 

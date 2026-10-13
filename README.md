@@ -23,17 +23,17 @@ castmymovie
 
 3 · Choose the quality ─────────────────────────────────────────────────
 ❯ How good is the Wi-Fi to your TV?
- ❯ Weak Wi-Fi  6 Mbps   instant remux   2.4 GHz or far from the router (safest)
-   Good Wi-Fi  10 Mbps  instant remux   5 GHz in the same room
-   Great Wi-Fi 20 Mbps  instant remux   5 GHz with a strong signal
-   Original    no cap   instant remux   keep the quality, only fix what is incompatible
+ ❯ Weak Wi-Fi  6 Mbit/s   instant remux   2.4 GHz or far from the router (safest)
+   Good Wi-Fi  10 Mbit/s  instant remux   5 GHz in the same room
+   Great Wi-Fi 20 Mbit/s  instant remux   5 GHz with a strong signal
+   Original    no cap     instant remux   keep the quality, only fix what is incompatible
    Custom…
 
   Remuxing   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% 121.9× 0:00:00 ETA 0:00:00 38 MB
-╭────────────────────────────────── Ready ──────────────────────────────────╮
-│ clip.cast.mp4  38 MB  ·  done in 00:02                                    │
-│ ✓ Verified: duration matches, index at the front, peak 4.5 Mbps (limit 6) │
-╰───────────────────────────────────────────────────────────────────────────╯
+╭─────────────────────────────────── Ready ───────────────────────────────────╮
+│ clip.cast.mp4  38 MB  ·  done in 00:02                                      │
+│ ✓ Verified: duration matches, index at the front, peak 4.5 Mbit/s (limit 6) │
+╰─────────────────────────────────────────────────────────────────────────────╯
 
 4 · Play it on your TV ─────────────────────────────────────────────────
 ❯ Which TV?
@@ -45,7 +45,7 @@ castmymovie
 │ ▶ 50:41 ━━━━━━━━━━━━━━╺━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2:34:45          │
 │                                                                       │
 │ Buffer ━━━━━━━━━━━━━━━━━━━━━━╺━ ≈ 55 s (estimate) comfortable         │
-│ Link   1.0 Mbps (needs 0.7) · 16 ms · 0.1% retransmits   ● good       │
+│ Link   1.0 Mbit/s (needs 0.7) · 16 ms · 0.1% retransmits   ● good     │
 │                                                                       │
 │ playing   space pause   ←/→ ±10 s   ↑/↓ ±2 min   q stop               │
 ╰───────────────────────────────────────────────────────────────────────╯
@@ -84,10 +84,10 @@ also plays in Chrome. Text subtitles are saved next to it as `.vtt` files.
 
 ### Why VLC instead of casting from Chrome
 
-Chrome's tab casting is a *live mirror*: it re-encodes the page in real time at about 5 Mbps, 1080p,
+Chrome's tab casting is a *live mirror*: it re-encodes the page in real time at about 5 Mbit/s, 1080p,
 30 fps and stereo
 ([Chromium source](https://chromium.googlesource.com/chromium/src/+/main/components/mirroring/service/mirror_settings.cc)),
-with almost no buffer. One Wi-Fi hiccup and it stutters or drops to a blocky 0.3 Mbps. VLC instead serves
+with almost no buffer. One Wi-Fi hiccup and it stutters or drops to a blocky 0.3 Mbit/s. VLC instead serves
 the file and the **TV pulls it and buffers it**, which rides out the spikes. The video is passed through
 untouched (HEVC stays HEVC); only the audio is converted on the fly.
 
@@ -101,7 +101,7 @@ where the pause, seek and position bar come from.
 | `▶ 50:41 ━━ 2:34:45` | Position and length. VLC's clock tracks the TV to within about a second. |
 | `playing` / `paused` / `buffering…` | The TV's own state. `buffering…` comes straight from the TV, so it is exact. |
 | `Buffer ≈ 55 s (estimate)` | Roughly how many seconds the TV has downloaded ahead of what it is showing. |
-| `Link 1.0 Mbps (needs 0.7) · 16 ms · 0.1% retransmits` | Over the last 30 s: data delivered vs what the movie needs, round-trip time, and the share of data that had to be re-sent. |
+| `Link 1.0 Mbit/s (needs 0.7) · 16 ms · 0.1% retransmits` | Over the last 30 s: data delivered vs what the movie needs, round-trip time, and the share of data that had to be re-sent. |
 | `● good / fair / poor / refilling` | One-word verdict. `refilling` means a seek just emptied the buffer, which is normal. |
 
 **The buffer figure is an estimate, good to roughly ±10 s and sometimes worse.** A Cast TV never says how much it has buffered
@@ -129,30 +129,30 @@ the Link row is simply left out.
 
 | Option | Peak limit | Pick it when |
 |---|---|---|
-| Weak Wi-Fi | 6 Mbps | the TV is on 2.4 GHz or far from the router (default, safest) |
-| Good Wi-Fi | 10 Mbps | 5 GHz in the same room |
-| Great Wi-Fi | 20 Mbps | 5 GHz with a strong signal |
+| Weak Wi-Fi | 6 Mbit/s | the TV is on 2.4 GHz or far from the router (default, safest) |
+| Good Wi-Fi | 10 Mbit/s | 5 GHz in the same room |
+| Great Wi-Fi | 20 Mbit/s | 5 GHz with a strong signal |
 | Original | none | you only want incompatible parts fixed |
 | Custom | your number | you measured your link |
 
 The limit applies to the **peak** over any 10 second window of video + audio, measured from real packet
-sizes rather than the container's average, because a 1.8 Mbps average file can burst to 5+ Mbps.
+sizes rather than the container's average, because a 1.8 Mbit/s average file can burst to 5+ Mbit/s.
 
-### Why 6 Mbps for 2.4 GHz?
+### Why 6 Mbit/s for 2.4 GHz?
 
 > These are estimates from published figures and standard rules of thumb, not a measurement of your
 > network. Pick *Custom* to tune.
 
 - A Chromecast/Google TV-class device has **one antenna**, and 2.4 GHz allows **20 MHz** channels in
-  practice. 802.11n peaks at a 72 Mbps link rate there.
-- Real TCP throughput is a fraction of that. Published tests land around 20-30 Mbps in decent conditions,
-  with ~60 Mbps as a ceiling on better hardware
+  practice. 802.11n peaks at a 72 Mbit/s link rate there.
+- Real TCP throughput is a fraction of that. Published tests land around 20-30 Mbit/s in decent conditions,
+  with ~60 Mbit/s as a ceiling on better hardware
   ([source](https://blog.wirelessmoves.com/2023/09/wi-fi-bandwidth-vs-range-vs-throughput.html)).
 - 2.4 GHz is shared with neighbours' networks, microwaves and Bluetooth, and walls push the device to
-  slower modulations and retries. I assume a **worst realistic sustained rate of about 12 Mbps** (an
+  slower modulations and retries. I assume a **worst realistic sustained rate of about 12 Mbit/s** (an
   engineering assumption, not a measurement).
 - Streaming needs headroom for retries and bursts: **2-3× the bitrate** is the usual rule.
-  12 Mbps ÷ 2 = **6 Mbps**, and that is a peak, not an average.
+  12 Mbit/s ÷ 2 = **6 Mbit/s**, and that is a peak, not an average.
 
 When re-encoding, video is capped at 90% of the limit minus the audio bitrate with a 1-second buffer, so no
 10 s window can exceed it. To measure your own link, run a speed test app on the TV and use *Custom* with
@@ -166,7 +166,7 @@ about measured ÷ 2.5.
 | Video codec | H.264 Baseline/Main/High, 8-bit 4:2:0, level ≤ 4.2; or HEVC ≤ 5.1 if this Mac's Chrome (≥ 107) can hardware-decode it | re-encode to H.264 |
 | Resolution | ≤ 1920×1080 | downscale |
 | Scan type | progressive | deinterlace |
-| Audio | AAC / MP3 / Opus / FLAC, ≤ 5.1 | convert to AAC (stereo 192k, 5.1 384k) |
+| Audio | AAC / MP3 / Opus / FLAC, ≤ 5.1 | convert to AAC (stereo 192 kbit/s, 5.1 384 kbit/s) |
 | Bitrate | worst 10 s window ≤ your limit | re-encode with a hard cap |
 | Frame rate, HDR | heads-up only | warned, not changed |
 | Subtitles | n/a | text tracks exported as `.vtt` |

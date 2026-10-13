@@ -167,7 +167,7 @@ class Flow(unittest.TestCase):
         self.assertIn("≈ 30 s", text)            # 31 s is rounded to the nearest 5 and flagged as an estimate
         self.assertIn("(estimate)", text)
         self.assertIn("comfortable", text)
-        self.assertIn("1.9 Mbps (needs 1.5)", text)
+        self.assertIn("1.9 Mbit/s (needs 1.5)", text)
         self.assertIn("19 ms", text)
         self.assertIn("0.1% retransmits", text)
         self.assertIn("● good", text)
@@ -247,7 +247,7 @@ class Flow(unittest.TestCase):
         w, out = make_wizard(script, found=[found(src)])
         self.assertEqual(w.run(), 0)
         self.assertIn("Enter a number", out.getvalue())
-        self.assertIn("12.5 Mbps", out.getvalue())
+        self.assertIn("12.5 Mbit/s", out.getvalue())
 
     def test_already_compatible_movie_is_not_touched(self):
         src = self.d / "good.mp4"

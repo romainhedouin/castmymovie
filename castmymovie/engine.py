@@ -450,11 +450,11 @@ def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = Fal
     avg = sc.video_avg_bps() + audio_bps
     cap = max_mbps * 1e6
     if peak <= cap * PEAK_TOLERANCE:
-        limit = "no cap" if max_mbps >= NO_CAP_MBPS else f"≤ {max_mbps:g} Mbps ({WINDOW_S} s window)"
-        checks.append(Check("Bitrate", True, f"avg {avg / 1e6:.1f} Mbps, peak {peak / 1e6:.1f} Mbps {limit}"))
+        limit = "no cap" if max_mbps >= NO_CAP_MBPS else f"≤ {max_mbps:g} Mbit/s ({WINDOW_S} s window)"
+        checks.append(Check("Bitrate", True, f"avg {avg / 1e6:.1f} Mbit/s, peak {peak / 1e6:.1f} Mbit/s {limit}"))
     else:
-        checks.append(Check("Bitrate", False, f"peak {peak / 1e6:.1f} Mbps > {max_mbps:g} Mbps: too much for this Wi-Fi"))
-        plan.video_why.append(f"cap bitrate to {max_mbps:g} Mbps")
+        checks.append(Check("Bitrate", False, f"peak {peak / 1e6:.1f} Mbit/s > {max_mbps:g} Mbit/s: too much for this Wi-Fi"))
+        plan.video_why.append(f"cap bitrate to {max_mbps:g} Mbit/s")
 
     # --- subtitles
     if subs:
@@ -590,7 +590,7 @@ def cumulative_curve(stats: dict, duration: float) -> list:
 @dataclass
 class Verification:
     problems: list
-    verdict: str   # e.g. "peak 4.5 Mbps (limit 6)"
+    verdict: str   # e.g. "peak 4.5 Mbit/s (limit 6)"
     decode_speed: float  # x real-time
     curve: list | None = None  # cumulative bitrate curve of the verified file
 
@@ -619,7 +619,7 @@ def verify(out: Path, src_duration: float, wants_audio: bool, max_mbps: float,
     peak = max((s.peak_bps() for i, s in stats.items() if kind.get(i) == "video"), default=0) \
         + sum(s.avg_bps(got) for i, s in stats.items() if kind.get(i) == "audio")
     limit = "no cap" if max_mbps >= NO_CAP_MBPS else f"limit {max_mbps:g}"
-    verdict = f"peak {peak / 1e6:.1f} Mbps ({limit})"
+    verdict = f"peak {peak / 1e6:.1f} Mbit/s ({limit})"
     if peak > max_mbps * 1e6 * PEAK_TOLERANCE:
         problems.append(verdict + ": above the limit")
     ok, speed, err = decode_test(out, got)
