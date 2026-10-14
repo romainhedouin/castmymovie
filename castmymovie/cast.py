@@ -82,10 +82,11 @@ def discover(timeout: float = 4.0) -> list:
             pass
 
     zc = Zeroconf()
+    browser = ServiceBrowser(zc, CAST_TYPE, Listener())
     try:
-        ServiceBrowser(zc, CAST_TYPE, Listener())
         time.sleep(timeout)
     finally:
+        browser.cancel()  # closing Zeroconf alone leaves the browser's thread running, one more per search
         zc.close()
     return sorted(found.values(), key=lambda r: r.name.lower())
 
@@ -119,7 +120,7 @@ def parse_time(text: str) -> float | None:
     if not text:
         return 0.0
     parts = text.split(":")
-    if len(parts) > 3 or not all(p.strip().isdigit() for p in parts):
+    if len(parts) > 3 or not all(p.strip().isdecimal() for p in parts):  # isdigit() also accepts '²', which int() rejects
         return None
     secs = 0
     for p in parts:
@@ -254,7 +255,10 @@ class VlcCast:
         now = time.monotonic()
         if position != self._last_pos:
             self._last_pos, self._last_move = position, now
-        buffering = alive and not self.paused and now - self._last_move > self.STALL_SECONDS
+        stuck = now - self._last_move > self.STALL_SECONDS
+        if alive and pos is None and self._last_pos >= 0 and stuck and self._number("is_playing") == 0:
+            alive = False  # VLC is up but has no input left: the movie ended or the TV stopped it
+        buffering = alive and not self.paused and stuck
         return PlayState(position, self.length, self.paused, buffering, alive)
 
     def toggle_pause(self) -> None:

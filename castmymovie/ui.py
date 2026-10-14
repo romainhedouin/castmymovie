@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import select
 import sys
 import time
@@ -19,7 +20,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
-from . import __version__, cast, engine, finder
+from . import __version__, cast, engine, finder, linkstats
 from .telemetry import Snapshot, Telemetry
 
 THEME = Theme({"accent": "bold cyan", "ok": "green", "bad": "bold red", "warn": "yellow", "dim": "dim"})
@@ -75,17 +76,32 @@ class Cancelled(Exception):
     pass
 
 
+class StyledTitle(list):
+    """A coloured title, a list of (style, text) pairs, that questionary's type-to-filter can search.
+
+    The filter calls `.lower()` on every title, which a plain list does not have: typing a letter in the menu
+    would crash the prompt and leave it hung."""
+
+    def lower(self) -> str:
+        return "".join(text for _, text in self).lower()
+
+
 class Prompter:
     """Arrow-key menus. Tests replace this with a scripted one."""
 
     def select(self, message: str, choices: list, default=None, filterable: bool = False):
-        items = [questionary.Choice(title=t, value=v) for t, v in choices]
-        default_item = next((c for c in items if c.value == default), None) if default is not None else None
-        return questionary.select(
+        # questionary swaps a None value for the title ("Quit" would come back as the string "Quit"), so it is
+        # given each choice's position instead and the real value is looked up afterwards
+        items = [questionary.Choice(title=StyledTitle(t) if isinstance(t, list) else t, value=i)
+                 for i, (t, _) in enumerate(choices)]
+        default_item = next((item for item, (_, v) in zip(items, choices) if v == default), None) \
+            if default is not None else None
+        picked = questionary.select(
             message, choices=items, default=default_item, style=QSTYLE, qmark="❯", pointer="❯",
             use_search_filter=filterable, use_jk_keys=not filterable,
             instruction="(↑/↓ move, Enter select" + (", type to filter)" if filterable else ")"),
         ).unsafe_ask()
+        return choices[picked][1]
 
     def confirm(self, message: str, default: bool = True) -> bool:
         return questionary.confirm(message, default=default, style=QSTYLE, qmark="❯").unsafe_ask()
@@ -101,6 +117,11 @@ class Keys:
     """Single-key reader for the live cast controls. Returns None on timeout."""
 
     NAMES = {b"\x1b[A": "up", b"\x1b[B": "down", b"\x1b[C": "right", b"\x1b[D": "left", b" ": "space"}
+    # one key press: an escape sequence (arrows), a lone escape, an ASCII character or a UTF-8 character
+    PRESS = re.compile(rb"\x1b\[[0-9;]*[A-Za-z~]|\x1bO[A-Za-z]|\x1b|[\x00-\x7f]|[\xc0-\xff][\x80-\xbf]*")
+
+    def __init__(self):
+        self.pending: list = []
 
     def __enter__(self):
         import termios
@@ -115,11 +136,14 @@ class Keys:
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
 
     def read(self, timeout: float = 0.5) -> str | None:
-        ready, _, _ = select.select([self.fd], [], [], timeout)
-        if not ready:
-            return None
-        data = os.read(self.fd, 8)
-        return self.NAMES.get(data, data.decode(errors="ignore").lower())
+        """One key per call. Several presses that arrive together (key repeat, a busy loop) are queued, not merged."""
+        if not self.pending:
+            ready, _, _ = select.select([self.fd], [], [], timeout)
+            if not ready:
+                return None
+            data = os.read(self.fd, 64)
+            self.pending = [self.NAMES.get(p, p.decode(errors="ignore").lower()) for p in self.PRESS.findall(data)]
+        return self.pending.pop(0) if self.pending else None
 
 
 def default_telemetry(session, receiver: cast.Receiver, curve):
@@ -179,7 +203,7 @@ class Wizard:
                 if not self.prompt.confirm("Do another movie?", default=False):
                     self.console.print("\n[dim]Enjoy the movie![/]")
                     return 0
-        except (KeyboardInterrupt, Cancelled):
+        except (KeyboardInterrupt, EOFError, Cancelled):  # Ctrl-D at a text prompt raises EOFError
             self.console.print("\n[dim]Cancelled. Bye![/]")
             return 130
 
@@ -203,7 +227,8 @@ class Wizard:
 
     def file_title(self, f: finder.Found):
         name = f.path.name if len(f.path.name) <= 58 else f.path.name[:40] + "…" + f.path.name[-16:]
-        folder = str(f.path.parent).replace(str(Path.home()), "~")
+        home, parent = Path.home(), f.path.parent
+        folder = "~" if parent == home else f"~/{parent.relative_to(home)}" if home in parent.parents else str(parent)
         mark = "  ✓ converted" if engine.output_path(f.path).exists() else ""
         return [("class:text", name), ("class:hint", f"   {engine.fmt_size(f.size)}   {folder}{mark}")]
 
@@ -223,7 +248,7 @@ class Wizard:
             outcome = engine.convert(sc, an, self.bar)
             self.show_outcome(outcome, an)
             return outcome
-        if an.plan.mode == "re-encode":
+        if an.plan.video == "encode":
             self.console.print("\n[warn]This needs a re-encode, which takes a while.[/] You can cancel with Ctrl-C.")
         self.console.print()
         try:
@@ -246,7 +271,7 @@ class Wizard:
         choices = []
         for a in audios:
             tags = a.get("tags", {})
-            title = f"#{a['index']}  {tags.get('language', 'und')}  {a['codec_name'].upper()} {a.get('channel_layout', '')}"
+            title = f"#{a['index']}  {tags.get('language', 'und')}  {a.get('codec_name', 'unknown').upper()} {a.get('channel_layout', '')}"
             if tags.get("title"):
                 title += f"  ({tags['title']})"
             choices.append((title, a["index"]))
@@ -261,14 +286,16 @@ class Wizard:
         t.add_column()
         t.add_row("File", f"[bold]{escape(sc.path.name)}[/]")
         t.add_row("Length", f"{engine.fmt_dur(sc.duration)}   {engine.fmt_size(sc.path.stat().st_size)}")
-        t.add_row("Video", f"{v['codec_name'].upper()} {v.get('width')}×{v.get('height')}  {engine.fps_of(v):.3g} fps")
+        t.add_row("Video", f"{v.get('codec_name', 'unknown').upper()} {v.get('width')}×{v.get('height')}  {engine.fps_of(v):.3g} fps")
         if a:
-            t.add_row("Audio", escape(f"{a['codec_name'].upper()} {a.get('channel_layout', '')}  [{a.get('tags', {}).get('language', 'und')}]"))
+            t.add_row("Audio", escape(f"{a.get('codec_name', 'unknown').upper()} {a.get('channel_layout', '')}  [{a.get('tags', {}).get('language', 'und')}]"))
         t.add_row("Bitrate", f"average {sc.video_avg_bps() / 1e6:.1f} Mbit/s, [bold]peak {sc.video_peak_bps() / 1e6:.1f} Mbit/s[/]")
         self.console.print()
         self.console.print(Panel(t, border_style="dim", expand=False))
 
     def preview(self, an: engine.Analysis) -> str:
+        if an.plan.mode == "re-encode" and an.plan.video == "copy":
+            return "remux + audio"  # only the sound is converted: seconds, not a slow video encode
         return {"as-is": "ready as is", "remux": "instant remux", "re-encode": "re-encode (slow)"}[an.plan.mode]
 
     def pick_quality(self, sc: engine.Scan, audio_index: int | None) -> engine.Analysis:
@@ -333,7 +360,7 @@ class Wizard:
             receiver = receiver or self.pick_receiver()
             if receiver is None:
                 return
-            start = self.ask_start()
+            start = self.ask_start(outcome.duration)
             self.cast_to(vlc, receiver, outcome.video, start, outcome.curve)
             action = self.prompt.select("What next?", [
                 ("Cast it again", "again"), ("Choose another TV", "tv"), ("Done with this movie", "done")])
@@ -362,13 +389,16 @@ class Wizard:
                 continue
             return pick
 
-    def ask_start(self) -> float:
+    def ask_start(self, duration: float = 0.0) -> float:
         while True:
             raw = self.prompt.text("Start at (e.g. 45:10 or 1:12:30, Enter = from the beginning):")
             secs = cast.parse_time(raw)
-            if secs is not None:
+            if secs is None:
+                self.console.print("[warn]Use minutes:seconds or hours:minutes:seconds, for example 1:12:30[/]")
+            elif duration and secs >= duration:  # VLC would sit idle until its start timeout, then blame the TV
+                self.console.print(f"[warn]That is past the end of the movie ({engine.fmt_dur(duration)}).[/]")
+            else:
                 return secs
-            self.console.print("[warn]Use minutes:seconds or hours:minutes:seconds, for example 1:12:30[/]")
 
     def cast_to(self, vlc: str, receiver: cast.Receiver, video: Path, start: float, curve=None) -> bool:
         session = self.caster(vlc, receiver, video, start)
@@ -462,7 +492,8 @@ class Wizard:
                     if tele:
                         tele.position = st.position
                     live.update(self.render_cast(st, receiver, video, interactive,
-                                                 tele.latest if tele else None, telemetry_on=tele is not None))
+                                                 tele.latest if tele else None,
+                                                 telemetry_on=tele is not None and linkstats.available()))
                     if not st.alive:
                         return
                     key = keys_cm.read(0.5) if keys_cm else time.sleep(0.5)

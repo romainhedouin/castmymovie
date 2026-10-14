@@ -250,6 +250,7 @@ class Scan:
 def scan(path: Path, progress: ProgressFactory = NullProgress) -> Scan:
     if not have_ffmpeg():
         raise CastError("ffmpeg not found. Install it first (macOS: brew install ffmpeg).")
+    path = Path(os.path.abspath(path))  # ffmpeg reads a relative "Movie: 1.mp4" as a URL and "-x.mp4" as an option
     info = probe(path)
     duration = float(info["format"].get("duration") or 0)
     if duration <= 0:
@@ -365,7 +366,7 @@ def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = Fal
         plan.container_why.append(f"{label} → MP4")
 
     # --- video codec
-    codec, pix = v["codec_name"], v.get("pix_fmt", "")
+    codec, pix = v.get("codec_name", "unknown"), v.get("pix_fmt", "")  # ffprobe omits the name of a codec it does not know
     level = int(v.get("level", 0) or 0)
     level = 0 if level < 0 else level
     hevc_ok = sys.platform == "darwin" and (sc.chrome is None or sc.chrome >= CHROME_MIN_HEVC)
@@ -420,7 +421,7 @@ def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = Fal
         plan.audio = "none"
         checks.append(Check("Audio", None, "no audio track"))
     else:
-        acodec, ach = a["codec_name"], int(a.get("channels", 2) or 2)
+        acodec, ach = a.get("codec_name", "unknown"), int(a.get("channels", 2) or 2)
         lang_tag = a.get("tags", {}).get("language", "und")
         allowed = WEBM_AUDIO if is_webm else MP4_AUDIO
         awhy: list[str] = []
@@ -443,6 +444,9 @@ def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = Fal
         if len(audios) > 1:
             others = ", ".join(f"#{x['index']} {x.get('tags', {}).get('language', 'und')}" for x in audios if x is not a)
             checks.append(Check("Audio tracks", None, f"{len(audios)} found, using #{a['index']} [{lang_tag}] (ignored: {others})"))
+            # VLC plays the file's default track, so the pick only holds if the other tracks leave the file
+            plan.remux = True
+            plan.container_why.append(f"keep only audio track #{a['index']}")
 
     # --- bitrate
     audio_bps = plan.audio_out_kbps * 1000 if a else 0  # measured when copied, target when re-encoded
@@ -471,6 +475,10 @@ def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = Fal
         plan.video, plan.video_why = "encode", ["repackaging VP9 as MP4: encode to H.264"]
     if plan.video == "encode":
         plan.remux = True
+    if a is not None and plan.audio == "copy" and plan.changes and acodec not in MP4_AUDIO:
+        # a rewritten file is always MP4, so audio that only WebM allows (Vorbis) has to be converted
+        plan.audio, plan.audio_why = "encode", [f"{acodec} is not supported in MP4"]
+        plan.audio_out_kbps = 384 if plan.audio_ch > 2 else 192 if plan.audio_ch == 2 else 96
     if plan.audio == "encode":
         plan.remux = True
     if codec == "hevc" and plan.video == "copy" and v.get("codec_tag_string") == "hev1":
@@ -505,6 +513,8 @@ def build_cmd(src: Path, dst: Path, plan: Plan, info: dict, max_mbps: float) -> 
             vf.append("yadif")
         if plan.scale:
             vf.append(f"scale=w={MAX_W}:h={MAX_H}:force_original_aspect_ratio=decrease:force_divisible_by=2")
+        elif int(v.get("width", 0)) % 2 or int(v.get("height", 0)) % 2:
+            vf.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")  # libx264 with yuv420p refuses odd dimensions
         cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-maxrate", f"{vmax}k", "-bufsize", f"{vmax}k",
                 "-profile:v", "high", "-level", "4.1", "-pix_fmt", "yuv420p"]
         if vf:
@@ -636,6 +646,7 @@ class Outcome:
     subtitles: list
     seconds: float
     curve: list | None = None         # cumulative bitrate curve of `video`, for the live buffer estimate
+    duration: float = 0.0             # length of the movie in seconds
 
 
 def _finish(sc: Scan, an: Analysis, video: Path, converted: bool, started: float,
@@ -645,7 +656,7 @@ def _finish(sc: Scan, an: Analysis, video: Path, converted: bool, started: float
         ver = verify(video, sc.duration, an.plan.audio != "none", an.max_mbps, progress)
     curve = ver.curve if ver else cumulative_curve(sc.stats, sc.duration)
     subs = export_subtitles(sc.path, video, sc.subtitles)
-    return Outcome(video, converted, ver, subs, time.monotonic() - started, curve)
+    return Outcome(video, converted, ver, subs, time.monotonic() - started, curve, sc.duration)
 
 
 def convert(sc: Scan, an: Analysis, progress: ProgressFactory = NullProgress, overwrite: bool = False) -> Outcome:

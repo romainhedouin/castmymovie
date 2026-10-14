@@ -52,4 +52,14 @@ def fixtures() -> Path:
        "-metadata:s:s:0", "language=eng", str(d / "subs.mkv"))
     ff(*video_src(), *audio_src(440), *audio_src(880), "-map", "0:v", "-map", "1:a", "-map", "2:a", *H264, *AAC,
        "-metadata:s:a:0", "language=eng", "-metadata:s:a:1", "language=fra", str(d / "dual.mkv"))
+    # already compatible (H.264/AAC, index first), but with two audio tracks
+    ff(*video_src(), *audio_src(440), *audio_src(880), "-map", "0:v", "-map", "1:a", "-map", "2:a", *H264, *AAC,
+       "-metadata:s:a:0", "language=eng", "-metadata:s:a:1", "language=fra", "-movflags", "+faststart",
+       str(d / "dual_aac.mp4"))
+    # odd dimensions: libx264 cannot encode them as they are
+    ff(*video_src("640x480", 3), *audio_src(dur=3), "-vf", "crop=321:241:exact=1", "-c:v", "mpeg4", "-q:v", "4",
+       "-pix_fmt", "yuv420p", *AAC, str(d / "odd.avi"))
+    # WebM audio (Vorbis) is not legal in the MP4 that a rewrite produces
+    ff(*video_src("320x180", 3), *audio_src(dur=3), "-c:v", "libvpx-vp9", "-b:v", "300k", "-c:a", "vorbis",
+       "-strict", "-2", "-ac", "2", str(d / "vorbis.webm"))
     return d

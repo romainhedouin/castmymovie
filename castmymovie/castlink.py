@@ -104,6 +104,8 @@ class StatusReader:
 
     # --- plumbing
     def _send(self, dest: str, namespace: str, payload: dict) -> None:
+        if self.sock is None:  # _drain closes the socket on EOF, even when it still hands back messages to answer
+            raise OSError("not connected")
         self._rid += 1
         self.sock.sendall(encode_message(SENDER, dest, namespace, dict(payload, requestId=self._rid)))
 

@@ -1,5 +1,7 @@
+import os
 import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -191,6 +193,49 @@ class EndToEnd(unittest.TestCase):
     def test_missing_ffprobe_target(self):
         with self.assertRaises(engine.CastError):
             engine.scan(self.d / "nope.mkv")
+
+    def test_relative_names_that_look_like_urls_or_options_still_scan(self):
+        with tempfile.TemporaryDirectory() as t:
+            for name in ("Movie: Part 1.mp4", "-dash.mp4"):
+                shutil.copy(self.d / "good.mp4", Path(t) / name)
+            here = os.getcwd()
+            os.chdir(t)
+            self.addCleanup(os.chdir, here)
+            for name in ("Movie: Part 1.mp4", "-dash.mp4"):
+                sc = engine.scan(Path(name))
+                self.assertTrue(sc.path.is_absolute(), sc.path)
+                self.assertGreater(sc.duration, 0)
+
+    def test_an_audio_pick_on_an_already_compatible_file_is_honoured(self):
+        sc = engine.scan(self.d / "dual_aac.mp4")
+        fra = next(a for a in sc.audios if a["tags"]["language"] == "fra")
+        an = engine.analyze(sc, audio_index=fra["index"])
+        self.assertEqual(an.plan.mode, "remux")           # otherwise VLC plays the file's default track
+        out = engine.convert(sc, an)
+        got = streams(out.video, "audio")
+        self.assertEqual((len(got), got[0]["tags"].get("language")), (1, "fra"))
+
+    def test_odd_dimensions_are_made_even_for_the_encoder(self):
+        sc = engine.scan(self.d / "odd.avi")
+        self.assertEqual((sc.video["width"], sc.video["height"]), (321, 241))
+        out = engine.convert(sc, engine.analyze(sc))
+        v = streams(out.video, "video")[0]
+        self.assertEqual((v["codec_name"], v["width"] % 2, v["height"] % 2), ("h264", 0, 0))
+        self.assertTrue(out.verification.ok, out.verification.problems)
+
+    def test_webm_audio_is_converted_when_the_output_becomes_mp4(self):
+        sc = engine.scan(self.d / "vorbis.webm")
+        self.assertFalse(engine.analyze(sc, 6.0).plan.changes)             # left alone, still a WebM
+        an = engine.analyze(sc, 0.2)                                       # a cap forces a rewrite into MP4
+        self.assertEqual((an.plan.video, an.plan.audio), ("encode", "encode"))
+        self.assertEqual(streams(engine.convert(sc, an).video, "audio")[0]["codec_name"], "aac")
+
+    def test_a_stream_ffprobe_cannot_name_is_not_a_crash(self):
+        info = {"format": {"format_name": "matroska,webm"},
+                "streams": [{"index": 0, "codec_type": "video", "width": 640, "height": 360},
+                            {"index": 1, "codec_type": "audio", "channels": 2}]}   # no codec_name, as ffprobe prints them
+        an = engine.analyze(engine.Scan(Path("x.mkv"), info, {}, 60.0, None))
+        self.assertEqual((an.plan.video, an.plan.audio), ("encode", "encode"))
 
 
 if __name__ == "__main__":

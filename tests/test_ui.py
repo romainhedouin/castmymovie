@@ -129,7 +129,7 @@ class Flow(unittest.TestCase):
 
     def test_full_happy_path_pick_convert_cast_with_controls(self):
         src = self.d / "plain.mkv"
-        script = Script(src, 6.0, True, TV, "1:30", "done", False)
+        script = Script(src, 6.0, True, TV, "0:04", "done", False)
         w, out = make_wizard(script, found=[found(src)], keys=["space", "right", "down", "q"])
         self.assertEqual(w.run(), 0)
         text = out.getvalue()
@@ -140,7 +140,7 @@ class Flow(unittest.TestCase):
         self.assertIn("Verified", text)
         self.assertIn("Casting to Living Room TV", text)
         cs = FakeCaster.instances[0]
-        self.assertEqual(cs.args[1:], (TV, self.d / "plain.cast.mp4", 90.0))
+        self.assertEqual(cs.args[1:], (TV, self.d / "plain.cast.mp4", 4.0))
         self.assertEqual(cs.calls, ["pause", ("seek", 10), ("seek", -120), "stop"])
 
     def test_every_arrow_key_has_its_step(self):
@@ -199,8 +199,18 @@ class Flow(unittest.TestCase):
         src = self.d / "plain.mkv"
         w, out = make_wizard(Script(src, 6.0, True, TV, "", "done", False), found=[found(src)],
                              tele=lambda curve: FakeTele(telemetry.Snapshot()))
-        w.run()
+        with mock.patch.object(ui.linkstats, "available", return_value=True):
+            w.run()
         self.assertIn("Measuring the link", out.getvalue())
+
+    def test_panel_does_not_claim_to_measure_a_link_it_cannot_read(self):
+        src = self.d / "plain.mkv"                     # no nettop (anything but macOS): no reading will ever arrive
+        w, out = make_wizard(Script(src, 6.0, True, TV, "", "done", False), found=[found(src)],
+                             tele=lambda curve: FakeTele(telemetry.Snapshot(tv_state="PLAYING")))
+        with mock.patch.object(ui.linkstats, "available", return_value=False):
+            w.run()
+        self.assertNotIn("Measuring the link", out.getvalue())
+        self.assertIn("Casting to Living Room TV", out.getvalue())
 
     def test_telemetry_is_started_and_always_stopped(self):
         src = self.d / "plain.mkv"
@@ -231,6 +241,27 @@ class Flow(unittest.TestCase):
         self.assertTrue(any(l.startswith("Weak Wi-Fi") and "re-encode" in l for l in labels), labels)
         self.assertTrue(any(l.startswith("Original") and "remux" in l for l in labels), labels)
         self.assertIn("Custom…", labels)
+
+    def test_home_is_abbreviated_only_as_a_leading_folder(self):
+        w, _ = make_wizard(Script())
+
+        def folder(path):
+            return w.file_title(finder.Found(Path(path), 123_000_000, 0))[1][1].split("   ")[-1]
+        with mock.patch.object(ui.Path, "home", return_value=Path("/Users/me")):
+            self.assertEqual(folder("/Users/me/Movies/a.mkv"), "~/Movies")
+            self.assertEqual(folder("/Users/me/a.mkv"), "~")
+            self.assertEqual(folder("/Users/me2/Movies/a.mkv"), "/Users/me2/Movies")             # another account
+            self.assertEqual(folder("/Volumes/Backup/Users/me/a.mkv"), "/Volumes/Backup/Users/me")  # not the home
+
+    def test_only_a_video_encode_is_called_slow(self):
+        w, _ = make_wizard(Script())
+
+        def preview(**plan):
+            return w.preview(engine.Analysis([], engine.Plan(**plan), 6.0, 0.0, 0.0, None))
+        self.assertEqual(preview(video="copy", audio="encode", remux=True), "remux + audio")   # seconds, not a re-encode
+        self.assertEqual(preview(video="encode", remux=True), "re-encode (slow)")
+        self.assertEqual(preview(remux=True), "instant remux")
+        self.assertEqual(preview(), "ready as is")
 
     def test_brackets_in_names_are_shown_literally(self):
         import shutil
@@ -307,10 +338,12 @@ class Flow(unittest.TestCase):
 
     def test_start_time_is_validated(self):
         src = self.d / "plain.mkv"
-        w, out = make_wizard(Script(src, 6.0, True, TV, "nonsense", "45:10", "done", False), found=[found(src)])
+        w, out = make_wizard(Script(src, 6.0, True, TV, "nonsense", "0:09", "0:04", "done", False), found=[found(src)])
         w.run()
         self.assertIn("hours:minutes:seconds", out.getvalue())
-        self.assertEqual(FakeCaster.instances[0].args[3], 2710.0)
+        self.assertIn("past the end of the movie (00:06)", out.getvalue())   # the movie is 6 s long
+        self.assertEqual(len(FakeCaster.instances), 1)
+        self.assertEqual(FakeCaster.instances[0].args[3], 4.0)
 
     def test_failed_cast_shows_help_and_can_retry_on_another_tv(self):
         src = self.d / "plain.mkv"

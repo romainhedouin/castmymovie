@@ -165,6 +165,13 @@ class Monitor(unittest.TestCase):
         self.feed(m, 20, 250_000, start=6.0, bytes0=6 * 250_000)
         self.assertAlmostEqual(m.health().delivered_mbps, 2.0, delta=0.05)
 
+    def test_readings_go_stale_once_the_samples_stop(self):
+        m = linkstats.LinkMonitor()
+        self.feed(m, 30, 250_000)
+        self.assertIsNotNone(m.health(now=30.0))
+        self.assertIsNone(m.health(now=30.0 + m.STALE_AFTER + 1))    # the stream connection is gone: no "good" link
+        self.assertIsNotNone(m.health())                              # without a clock the last readings are served
+
     def test_counter_reset_starts_over_instead_of_going_negative(self):
         m = linkstats.LinkMonitor()
         self.feed(m, 20, 250_000)

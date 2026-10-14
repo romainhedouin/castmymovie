@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,5 +76,5 @@ def clean_dropped_path(text: str) -> Path:
     t = text.strip()
     if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"":
         t = t[1:-1]
-    t = t.replace("\\ ", " ").replace("\\(", "(").replace("\\)", ")").replace("\\'", "'")
+    t = re.sub(r"\\(.)", r"\1", t)  # the terminal escapes spaces, quotes, brackets, &, ... one backslash each
     return Path(os.path.expanduser(t))

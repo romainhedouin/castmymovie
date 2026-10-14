@@ -3,6 +3,7 @@ import stat
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -22,6 +23,8 @@ rc = int(next(a for a in args if a.startswith("--rc-host=")).rsplit(":", 1)[1])
 start = int(next((a.split("=")[1] for a in args if a.startswith("--start-time=")), 0))
 open(os.environ["FAKE_ARGS_FILE"], "w").write(" ".join(args))
 st = {"t": float(start), "paused": False, "len": 600, "playing": False}
+end = float(os.environ.get("FAKE_END_AT", 0))   # the movie ends here: VLC stays up but has no input left
+def ended(): return end and st["t"] >= end
 def tick():
     time.sleep(0.6)
     st["playing"] = not os.environ.get("FAKE_NEVER_PLAY")
@@ -42,9 +45,9 @@ while True:
     while b"\n" in buf:
         line, buf = buf.split(b"\n", 1)
         cmd = line.decode().strip()
-        if cmd == "get_time": c.sendall(("%%d\r\n> " %% st["t"]).encode())
+        if cmd == "get_time": c.sendall(b"\r\n> " if ended() else ("%%d\r\n> " %% st["t"]).encode())
         elif cmd == "get_length": c.sendall(("%%d\r\n> " %% st["len"]).encode())
-        elif cmd == "is_playing": c.sendall(b"1\r\n> " if st["playing"] else b"0\r\n> ")
+        elif cmd == "is_playing": c.sendall(b"1\r\n> " if st["playing"] and not ended() else b"0\r\n> ")
         elif cmd == "pause": st["paused"] = not st["paused"]; c.sendall(b"> ")
         elif cmd.startswith("seek "): st["t"] = float(cmd.split()[1]); c.sendall(b"> ")
         elif cmd == "quit": c.sendall(b"Bye-bye!\r\n"); open(os.environ["FAKE_ARGS_FILE"] + ".quit", "w").close()
@@ -60,8 +63,27 @@ class Pure(unittest.TestCase):
         self.assertEqual(cast.parse_time("90"), 90.0)
         self.assertEqual(cast.parse_time("12:30"), 750.0)
         self.assertEqual(cast.parse_time("1:02:03"), 3723.0)
-        for bad in ("abc", "1:2:3:4", "-5", "1:xx", "1.5"):
+        for bad in ("abc", "1:2:3:4", "-5", "1:xx", "1.5", "1:²", "①"):   # str.isdigit() accepts the last two
             self.assertIsNone(cast.parse_time(bad), bad)
+
+    def test_discovery_cancels_its_browser_before_closing(self):
+        events = []
+
+        class Zc:
+            def close(self):
+                events.append("close")
+
+        class Browser:
+            def __init__(self, zc, type_, listener):
+                events.append("browse")
+
+            def cancel(self):
+                events.append("cancel")      # closing Zeroconf alone leaves the browser thread running
+
+        fake = types.SimpleNamespace(Zeroconf=Zc, ServiceBrowser=Browser, ServiceListener=object)
+        with mock.patch.dict(sys.modules, {"zeroconf": fake}):
+            self.assertEqual(cast.discover(timeout=0), [])
+        self.assertEqual(events, ["browse", "cancel", "close"])
 
     def test_receiver_from_service(self):
         r = cast.receiver_from_service({"fn": "Living Room TV", "md": "MiTV-MOEU0", "id": "abc", "ca": "463365"},
@@ -154,6 +176,19 @@ class Session(unittest.TestCase):
         s.state()
         time.sleep(0.8)
         self.assertTrue(s.state().buffering)
+
+    def test_a_finished_movie_is_reported_as_ended_not_buffering_forever(self):
+        with mock.patch.dict(os.environ, {"FAKE_END_AT": "60"}):
+            s = self.make(start=50)
+            s.start(timeout=15)
+        s.STALL_SECONDS = 0.4
+        deadline, st = time.monotonic() + 10, s.state()
+        while st.alive and time.monotonic() < deadline:
+            time.sleep(0.3)
+            st = s.state()
+        self.assertTrue(s.proc.poll() is None, "VLC itself is still running")
+        self.assertFalse(st.alive, "nothing is left to play, so the live view has to end")
+        self.assertFalse(st.buffering)
 
     def test_stop_ends_the_process_even_though_vlc_ignores_quit(self):
         s = self.make()

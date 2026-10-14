@@ -137,7 +137,7 @@ class Telemetry:
         sample = self.read_link(self.pid, self.host)
         if sample:
             self.link.add(sample)
-        health = self.link.health()
+        health = self.link.health(now)
 
         position = self.position
         stalled = bool(tv and tv.state == "BUFFERING")

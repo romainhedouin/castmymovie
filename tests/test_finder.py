@@ -48,6 +48,11 @@ class Finder(unittest.TestCase):
                          Path("/a b/Jackie Brown (1997).mp4"))
         self.assertEqual(finder.clean_dropped_path("~/x.mkv"), Path.home() / "x.mkv")
 
+    def test_dropped_paths_with_every_kind_of_escape(self):
+        # the terminal puts one backslash before each space, quote, bracket, ampersand, ...
+        self.assertEqual(finder.clean_dropped_path(r"/a\ b/My\ Movie\'s\ \[1080p\]\ \&\ more\ \(2020\).mkv"),
+                         Path("/a b/My Movie's [1080p] & more (2020).mkv"))
+
 
 if __name__ == "__main__":
     unittest.main()

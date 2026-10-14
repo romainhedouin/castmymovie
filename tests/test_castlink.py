@@ -201,6 +201,15 @@ class Reader(unittest.TestCase):
         r.close()  # safe to call repeatedly
         r.close()
 
+    def test_tv_hanging_up_right_after_answering_is_a_clean_failure(self):
+        tv = self.tv(close_after=2)  # sends RECEIVER_STATUS and hangs up in the same breath
+        r = reader_for(tv)
+        self.assertFalse(r.open(timeout=3))
+        self.assertFalse(r.connected)
+        self.assertIsNone(r.poll())
+        with self.assertRaises(OSError):  # an ordinary error, which every caller already handles
+            r._send("receiver-0", castlink.RECV_NS, {"type": "GET_STATUS"})
+
     def test_tv_hanging_up_keeps_the_last_status_and_disconnects(self):
         tv = self.tv(close_after=5)  # CONNECT, GET_STATUS, CONNECT(app), PING, then one media GET_STATUS (answered, then hang up)
         r = reader_for(tv)

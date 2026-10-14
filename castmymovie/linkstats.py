@@ -87,6 +87,7 @@ class LinkMonitor:
     RATE_WINDOW = 30.0   # the TV pulls in bursts, so a short window would swing between 0 and a few Mbit/s
     RETX_WINDOW = 60.0
     MIN_RATE_SPAN = 15.0
+    STALE_AFTER = 8.0    # no sample for this long (stream connection gone): the last numbers are history, not health
 
     def __init__(self):
         self.samples: deque = deque(maxlen=400)
@@ -101,8 +102,11 @@ class LinkMonitor:
         old = next((s for s in self.samples if newest.t - s.t <= seconds), self.samples[0])
         return old, newest
 
-    def health(self) -> LinkHealth | None:
+    def health(self, now: float | None = None) -> LinkHealth | None:
+        """Recent health. Pass `now` (same clock as the samples) to drop readings that have gone stale."""
         if not self.samples:
+            return None
+        if now is not None and now - self.samples[-1].t > self.STALE_AFTER:
             return None
         if len(self.samples) < 2:
             return LinkHealth(None, None, self.samples[-1].rtt_ms)   # e.g. right after a seek replaced the connection
