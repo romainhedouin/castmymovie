@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import collections
 import json
+import math
 import os
 import plistlib
 import re
@@ -20,6 +21,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
@@ -31,13 +33,19 @@ PEAK_TOLERANCE = 1.05
 MAX_W, MAX_H = 1920, 1080  # Chrome tab mirroring tops out at 1080p
 MAX_FPS = 30.5  # ... and at 30 fps by default
 CHROME_MIN_HEVC = 107  # first Chrome with hardware HEVC decode
+SEG_SECONDS = 6  # length of a cast-on-the-fly HLS segment (see onthefly.py)
 
 H264_PROFILES = {"Baseline", "Constrained Baseline", "Main", "High"}
 H264_MAX_LEVEL = 42  # Chromecast 3rd gen limit, the lowest common denominator
 HEVC_MAX_LEVEL = 153
 HEVC_PIX_FMTS = {"yuv420p", "yuv420p10le"}
 AAC_PROFILES = {"LC", "HE-AAC", "HE-AACv2"}
-MP4_AUDIO = {"aac", "mp3", "opus", "flac"}
+MP4_AUDIO = {"aac", "mp3", "opus", "flac"}  # what a Cast TV plays itself from an MP4, up to 5.1
+# VLC hands only AAC (up to stereo) and Opus to the TV untouched. Everything else (5.1 AAC, MP3, FLAC, AC-3, ...) it
+# decodes and re-encodes live inside the cast, and that live transcode is the fragile part of a stream, so when the
+# movie is meant for VLC (`analyze(..., for_vlc=True)`) such audio is converted up front, where there is no deadline.
+VLC_AUDIO = {"aac", "opus"}
+VLC_MAX_CH = 2
 WEBM_AUDIO = {"opus", "vorbis"}
 TEXT_SUBS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
 BITMAP_SUBS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"}
@@ -170,28 +178,54 @@ def scan_bitrates(path: Path, duration: float, label: str = "Analyzing",
     return dict(stats)
 
 
-def mp4_is_faststart(path: Path) -> bool:
-    """True when the moov atom precedes mdat, so playback can start before the file is fully read."""
+def mp4_boxes(path: Path):
+    """Yield (kind, payload offset) for each top-level MP4 box, in file order. Stops quietly at anything odd."""
     try:
         with open(path, "rb") as f:
             while True:
+                at = f.tell()
                 head = f.read(8)
                 if len(head) < 8:
-                    return False
+                    return
                 size, kind = int.from_bytes(head[:4], "big"), head[4:].decode("latin1")
-                if kind == "moov":
-                    return True
-                if kind == "mdat":
-                    return False
+                header = 8
                 if size == 1:
-                    size = int.from_bytes(f.read(8), "big")
-                    f.seek(size - 16, 1)
-                elif size == 0:
-                    return False
-                else:
-                    f.seek(size - 8, 1)
+                    size, header = int.from_bytes(f.read(8), "big"), 16
+                yield kind, at + header
+                if size == 0 or size < header:  # 0 = "runs to the end of the file"; smaller is corrupt
+                    return
+                f.seek(at + size)
     except OSError:
-        return False
+        return
+
+
+def mp4_is_faststart(path: Path) -> bool:
+    """True when the moov atom precedes mdat, so playback can start before the file is fully read."""
+    for kind, _ in mp4_boxes(path):
+        if kind in ("moov", "mdat"):
+            return kind == "moov"
+    return False
+
+
+def mdat_offset(path: Path) -> int | None:
+    """Where the media data starts in an MP4: file offsets past it map to media time through the bitrate curve."""
+    return next((at for kind, at in mp4_boxes(path) if kind == "mdat"), None)
+
+
+def vlc_audio_issue(path: Path) -> str | None:
+    """Why VLC would have to convert this file's audio live while casting, or None if it passes it through."""
+    try:
+        audio = next((s for s in probe(path)["streams"] if s["codec_type"] == "audio"), None)
+    except (CastError, ValueError, KeyError):
+        return None
+    if audio is None:
+        return None
+    codec, ch = audio.get("codec_name", "unknown"), int(audio.get("channels", 2) or 2)
+    if codec not in VLC_AUDIO:
+        return f"{codec.upper()} audio"
+    if ch > VLC_MAX_CH:
+        return f"{audio.get('channel_layout') or f'{ch}-channel'} {codec.upper()} audio"
+    return None
 
 
 def chrome_major() -> int | None:
@@ -302,7 +336,7 @@ class Plan:
         if self.video == "encode":
             out.append("re-encode video: " + ", ".join(self.video_why))
         if self.audio == "encode":
-            out.append("convert audio to AAC")
+            out.append("convert audio to " + {1: "mono AAC", 2: "stereo AAC"}.get(self.audio_ch, "AAC"))
         return out
 
 
@@ -336,7 +370,9 @@ def pick_audio(audios: list, lang: str | None) -> dict | None:
 
 
 def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = False,
-            lang: str | None = None, audio_index: int | None = None) -> Analysis:
+            lang: str | None = None, audio_index: int | None = None, for_vlc: bool = False) -> Analysis:
+    """What the file needs. `for_vlc` adds VLC's own audio limits (see VLC_AUDIO); the default is for a TV that
+    plays the file itself, which the native cast does."""
     path, info, stats, duration = sc.path, sc.info, sc.stats, sc.duration
     v, audios, subs = sc.video, sc.audios, sc.subtitles
     a = next((x for x in audios if x["index"] == audio_index), None) if audio_index is not None \
@@ -423,18 +459,22 @@ def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = Fal
     else:
         acodec, ach = a.get("codec_name", "unknown"), int(a.get("channels", 2) or 2)
         lang_tag = a.get("tags", {}).get("language", "und")
-        allowed = WEBM_AUDIO if is_webm else MP4_AUDIO
+        allowed = WEBM_AUDIO if is_webm else VLC_AUDIO if for_vlc else MP4_AUDIO
         awhy: list[str] = []
         if acodec not in allowed:
-            awhy.append(f"{acodec.upper()} is not playable in Chrome here" if acodec in ("ac3", "eac3", "dts", "truehd") else f"{acodec} is not supported")
+            awhy.append(f"{acodec.upper()} would be converted live while casting" if for_vlc
+                        else f"{acodec.upper()} is not playable in Chrome here" if acodec in ("ac3", "eac3", "dts", "truehd")
+                        else f"{acodec} is not supported")
         elif acodec == "aac" and a.get("profile") not in AAC_PROFILES:
             awhy.append(f"AAC {a.get('profile')} is not supported")
+        elif for_vlc and acodec == "aac" and ach > VLC_MAX_CH:
+            awhy.append(f"{ach} channels would be downmixed live while casting")
         if ach > 6:
             awhy.append(f"{ach} channels (max 5.1)")
         layout = a.get("channel_layout", f"{ach}ch")
         checks.append(Check("Audio", not awhy,
                             f"{acodec.upper()} {layout} [{lang_tag}]" + ("" if not awhy else f": {'; '.join(awhy)}")))
-        plan.audio_ch = min(ach, 6)
+        plan.audio_ch = min(ach, VLC_MAX_CH if for_vlc else 6)  # what a re-encode produces
         if awhy:
             plan.audio, plan.audio_why = "encode", awhy
             plan.audio_out_kbps = 384 if plan.audio_ch > 2 else 192 if plan.audio_ch == 2 else 96
@@ -444,7 +484,7 @@ def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = Fal
         if len(audios) > 1:
             others = ", ".join(f"#{x['index']} {x.get('tags', {}).get('language', 'und')}" for x in audios if x is not a)
             checks.append(Check("Audio tracks", None, f"{len(audios)} found, using #{a['index']} [{lang_tag}] (ignored: {others})"))
-            # VLC plays the file's default track, so the pick only holds if the other tracks leave the file
+            # the TV (and VLC) play the file's default track, so the pick only holds if the other tracks leave the file
             plan.remux = True
             plan.container_why.append(f"keep only audio track #{a['index']}")
 
@@ -475,7 +515,7 @@ def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = Fal
         plan.video, plan.video_why = "encode", ["repackaging VP9 as MP4: encode to H.264"]
     if plan.video == "encode":
         plan.remux = True
-    if a is not None and plan.audio == "copy" and plan.changes and acodec not in MP4_AUDIO:
+    if a is not None and plan.audio == "copy" and plan.changes and acodec not in (VLC_AUDIO if for_vlc else MP4_AUDIO):
         # a rewritten file is always MP4, so audio that only WebM allows (Vorbis) has to be converted
         plan.audio, plan.audio_why = "encode", [f"{acodec} is not supported in MP4"]
         plan.audio_out_kbps = 384 if plan.audio_ch > 2 else 192 if plan.audio_ch == 2 else 96
@@ -494,36 +534,124 @@ def output_path(src: Path) -> Path:
     return src.with_name(f"{src.stem}.cast.mp4")
 
 
+def _video_args(plan: Plan, v: dict, max_mbps: float) -> list:
+    if plan.video == "copy":
+        return ["-c:v", "copy"] + (["-tag:v", "hvc1"] if v["codec_name"] == "hevc" else [])
+    # VBV window = 1 s, so any 10 s window carries at most 1.1x maxrate; 0.9 keeps that under the cap
+    vmax = max(500, int(min(max_mbps, 100) * 1000 * 0.9 - plan.audio_out_kbps))
+    vf = []
+    if plan.deinterlace:
+        vf.append("yadif")
+    if plan.scale:
+        vf.append(f"scale=w={MAX_W}:h={MAX_H}:force_original_aspect_ratio=decrease:force_divisible_by=2")
+    elif int(v.get("width", 0)) % 2 or int(v.get("height", 0)) % 2:
+        vf.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")  # libx264 with yuv420p refuses odd dimensions
+    args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-maxrate", f"{vmax}k", "-bufsize", f"{vmax}k",
+            "-profile:v", "high", "-level", "4.1", "-pix_fmt", "yuv420p"]
+    return args + (["-vf", ",".join(vf)] if vf else [])
+
+
+def _audio_args(plan: Plan) -> list:
+    if plan.audio == "copy":
+        return ["-c:a", "copy"]
+    if plan.audio == "encode":
+        return ["-c:a", "aac", "-b:a", f"{plan.audio_out_kbps}k", "-ac", str(plan.audio_ch), "-ar", "48000"]
+    return []
+
+
 def build_cmd(src: Path, dst: Path, plan: Plan, info: dict, max_mbps: float) -> list:
     v = next(s for s in info["streams"] if s["index"] == plan.video_idx)
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-progress", "pipe:1", "-nostats",
            "-y", "-i", str(src), "-map", f"0:{plan.video_idx}"]
     if plan.audio_idx is not None:
         cmd += ["-map", f"0:{plan.audio_idx}"]
-    cmd += ["-sn", "-dn"]
-    if plan.video == "copy":
-        cmd += ["-c:v", "copy"]
-        if v["codec_name"] == "hevc":
-            cmd += ["-tag:v", "hvc1"]
-    else:
-        # VBV window = 1 s, so any 10 s window carries at most 1.1x maxrate; 0.9 keeps that under the cap
-        vmax = max(500, int(min(max_mbps, 100) * 1000 * 0.9 - plan.audio_out_kbps))
-        vf = []
-        if plan.deinterlace:
-            vf.append("yadif")
-        if plan.scale:
-            vf.append(f"scale=w={MAX_W}:h={MAX_H}:force_original_aspect_ratio=decrease:force_divisible_by=2")
-        elif int(v.get("width", 0)) % 2 or int(v.get("height", 0)) % 2:
-            vf.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")  # libx264 with yuv420p refuses odd dimensions
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-maxrate", f"{vmax}k", "-bufsize", f"{vmax}k",
-                "-profile:v", "high", "-level", "4.1", "-pix_fmt", "yuv420p"]
-        if vf:
-            cmd += ["-vf", ",".join(vf)]
-    if plan.audio == "copy":
-        cmd += ["-c:a", "copy"]
-    elif plan.audio == "encode":
-        cmd += ["-c:a", "aac", "-b:a", f"{plan.audio_out_kbps}k", "-ac", str(plan.audio_ch), "-ar", "48000"]
+    cmd += ["-sn", "-dn"] + _video_args(plan, v, max_mbps) + _audio_args(plan)
     cmd += ["-avoid_negative_ts", "make_zero", "-movflags", "+faststart", "-f", "mp4", str(dst)]
+    return cmd
+
+
+# ---------------------------------------------------------------- cast on the fly (HLS segments)
+
+TS_AUDIO = {"aac", "mp3"}  # what an MPEG-TS segment carries and the TV plays (opus and flac only fit MP4)
+STANDARD_RATES = [Fraction(24000, 1001), Fraction(24), Fraction(25), Fraction(30000, 1001), Fraction(30),
+                  Fraction(50), Fraction(60000, 1001), Fraction(60)]
+TS_REORDER_FRAMES = 2  # x264 veryfast delays the first video timestamp by this many frames (see build_hls_cmd)
+
+
+def snap_rate(fps: float) -> Fraction:
+    """The standard frame rate nearest to `fps` when it is within 0.1 % of one (variable-rate sources report averages
+    such as 23.9761), otherwise `fps` as a plain fraction."""
+    best = min(STANDARD_RATES, key=lambda r: abs(float(r) - fps))
+    if abs(float(best) - fps) <= float(best) * 0.001:
+        return best
+    return Fraction(fps).limit_denominator(1001)
+
+
+def cfr_rate(stream: dict) -> Fraction:
+    """The constant frame rate the segments are cut at: the source's."""
+    return snap_rate(fps_of(stream) or 24.0)
+
+
+def needs_audio_pass(plan: Plan, info: dict) -> bool:
+    """On the fly only the video is encoded live: audio that must be converted, or that TS cannot carry, is done first."""
+    if plan.audio in ("none", None) or plan.audio_idx is None:
+        return False
+    if plan.audio == "encode":
+        return True
+    a = next((s for s in info["streams"] if s["index"] == plan.audio_idx), {})
+    return a.get("codec_name") not in TS_AUDIO
+
+
+def audio_out_kbps(channels: int) -> int:
+    return 384 if channels > 2 else 192 if channels == 2 else 96
+
+
+def build_audio_cmd(src: Path, dst: Path, plan: Plan, info: dict) -> list:
+    """The audio track alone, as AAC, in a Matroska file. `-copyts` keeps its timestamps where the movie has them, so
+    the video pass can read it as a second input without the two drifting apart."""
+    a = next(s for s in info["streams"] if s["index"] == plan.audio_idx)
+    channels = min(int(a.get("channels", 2) or 2), 6)
+    return ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-progress", "pipe:1", "-nostats", "-y",
+            "-i", str(src), "-map", f"0:{plan.audio_idx}", "-vn", "-sn", "-dn", "-copyts",
+            "-c:a", "aac", "-b:a", f"{audio_out_kbps(channels)}k", "-ac", str(channels), "-ar", "48000",
+            "-f", "matroska", str(dst)]
+
+
+def build_hls_cmd(src: Path, audio_src: Path | None, outdir: Path, plan: Plan, info: dict, max_mbps: float,
+                  fps: Fraction, seg_frames: int, start_index: int = 0) -> list:
+    """Encode the video into `seg%05d.ts` segments of exactly `seg_frames` frames, numbered from `start_index`.
+
+    The GOP is a fixed frame count, not a duration: that makes every segment last exactly seg_frames/fps, so the
+    playlist the TV gets can state the lengths before they exist. Segment i then starts at i * seg_frames / fps on the
+    movie's clock. A run that starts mid-movie seeks both inputs there and shifts its timestamps by the same amount
+    (plus the reorder delay the first run has naturally), so segments from different runs join without a gap.
+    `audio_src` is the audio pass's output; without it the chosen track is copied from `src` (TS-compatible codecs only)."""
+    v = next(s for s in info["streams"] if s["index"] == plan.video_idx)
+    at = start_index * seg_frames / fps
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-progress", "pipe:1", "-nostats", "-y"]
+    if start_index:
+        cmd += ["-ss", f"{float(at):.6f}"]
+    cmd += ["-i", str(src)]
+    if audio_src is not None:
+        if start_index:
+            cmd += ["-ss", f"{float(at):.6f}"]
+        cmd += ["-i", str(audio_src)]
+    cmd += ["-map", f"0:{plan.video_idx}"]
+    if audio_src is not None:
+        cmd += ["-map", "1:0"]
+    elif plan.audio_idx is not None:
+        cmd += ["-map", f"0:{plan.audio_idx}"]
+    cmd += ["-sn", "-dn"] + _video_args(plan, v, max_mbps)
+    cmd += ["-r", f"{fps.numerator}/{fps.denominator}", "-fps_mode", "cfr",
+            "-g", str(seg_frames), "-keyint_min", str(seg_frames), "-sc_threshold", "0"]
+    if plan.audio_idx is not None:
+        cmd += ["-c:a", "copy", "-copypriorss", "0"]  # without it a seeked copy starts at the previous packet cluster
+    cmd += ["-muxdelay", "0", "-muxpreload", "0"]
+    if start_index:
+        cmd += ["-output_ts_offset", f"{float(at + TS_REORDER_FRAMES / fps):.6f}"]
+    cmd += ["-f", "hls", "-hls_time", str(SEG_SECONDS), "-hls_list_size", "0", "-hls_segment_type", "mpegts",
+            "-hls_flags", "temp_file+independent_segments", "-start_number", str(start_index),
+            "-hls_segment_filename", str(outdir / "seg%05d.ts"), str(outdir / "ffmpeg.m3u8")]
     return cmd
 
 
@@ -690,7 +818,7 @@ def reuse_existing(sc: Scan, an: Analysis, progress: ProgressFactory = NullProgr
 # ---------------------------------------------------------------- formatting
 
 def fmt_dur(seconds: float) -> str:
-    h, rem = divmod(int(max(0, seconds)), 3600)
+    h, rem = divmod(int(max(0, seconds)) if math.isfinite(seconds) else 0, 3600)
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 

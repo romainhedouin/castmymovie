@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "castmymovie"
 version = "0.3.0"
-description = "Get any movie onto your Google TV: pick it, make it cast-ready, play it with VLC."
+description = "Get any movie onto your Google TV: pick it, make it cast-ready, cast it."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

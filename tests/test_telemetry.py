@@ -88,6 +88,40 @@ class Estimator(unittest.TestCase):
 
     def test_tiny_curve_gives_no_estimate(self):
         self.assertIsNone(telemetry.BufferEstimator([0, 5]).update(1.0, 10))
+        self.assertIsNone(telemetry.BufferEstimator([0, 5]).update_exact(1.0, 10))
+
+
+class ExactEstimator(unittest.TestCase):
+    """Native cast: the server knows how far into the file the TV has read, so no byte counting is needed."""
+
+    def est(self):
+        return telemetry.BufferEstimator(CURVE, k=telemetry.NATIVE_K)
+
+    def test_the_read_offset_maps_straight_to_media_time(self):
+        self.assertAlmostEqual(self.est().update_exact(10.0, 40 * MB), 30.0)     # read up to 40 s, showing 10 s
+
+    def test_no_drift_from_earlier_bytes(self):
+        e = self.est()
+        e.update_exact(10.0, 40 * MB)
+        for t in range(11, 41):                                                  # half a minute of playing
+            v = e.update_exact(float(t), (t + 30) * MB)                          # the TV keeps 30 s ahead
+        self.assertAlmostEqual(v, 30.0, places=3)
+
+    def test_a_seek_back_restarts_the_download_and_reads_refilling(self):
+        e = self.est()
+        e.update_exact(100.0, 130 * MB)
+        self.assertEqual(e.update_exact(50.0, 50 * MB), 0.0)                     # new download from the seek point
+        self.assertTrue(e.reanchored)
+        self.assertAlmostEqual(e.update_exact(50.5, 60 * MB), 9.5 * 0.35, places=3)   # smoothing picks up again
+
+    def test_a_stall_is_an_empty_buffer(self):
+        e = self.est()
+        e.update_exact(10.0, 40 * MB)
+        self.assertEqual(e.update_exact(10.0, 40 * MB, stalled=True), 0.0)
+
+    def test_clamped(self):
+        self.assertEqual(self.est().update_exact(1.0, 900 * MB), telemetry.MAX_BUFFER_S)
+        self.assertEqual(self.est().update_exact(50.0, 1 * MB), 0.0)
 
 
 class Verdicts(unittest.TestCase):
@@ -171,6 +205,15 @@ class Monitor(unittest.TestCase):
         self.assertIsNotNone(m.health(now=30.0))
         self.assertIsNone(m.health(now=30.0 + m.STALE_AFTER + 1))    # the stream connection is gone: no "good" link
         self.assertIsNotNone(m.health())                              # without a clock the last readings are served
+
+    def test_retransmits_that_cannot_be_measured_are_left_out(self):
+        m = linkstats.LinkMonitor()
+        for i in range(31):                    # a native cast: byte counts from the server, nothing from TCP
+            m.add(linkstats.LinkSample(float(i), 250_000 * i, None, None))
+        h = m.health()
+        self.assertAlmostEqual(h.delivered_mbps, 2.0, delta=0.05)
+        self.assertIsNone(h.retx_pct)
+        self.assertIsNone(h.rtt_ms)
 
     def test_counter_reset_starts_over_instead_of_going_negative(self):
         m = linkstats.LinkMonitor()
@@ -266,6 +309,96 @@ class Coordinator(unittest.TestCase):
         snap = tele.step()
         self.assertIsNone(snap.buffer_s)
         self.assertIsNone(snap.tv_state)
+
+    def test_k_is_a_parameter(self):
+        tele = telemetry.Telemetry(1, "tv", CURVE, reader=self.make([(1, "PLAYING")])[0].reader,
+                                   read_link=lambda p, h: None, k=1.0)
+        tele.position = 100.0
+        self.assertAlmostEqual(tele.step().needed_mbps, 8.0, delta=0.01)          # 1 MB/s, nothing added
+
+    def test_a_native_session_is_read_through_its_own_counters(self):
+        class Session:
+            sent, reached, pos = 0, 0, 100.0
+
+            def tv_status(self):
+                return TvStatus(self.pos, "PLAYING", 1000.0)
+
+            def link_sample(self):
+                return linkstats.LinkSample(clock["t"], self.sent, None, None, self.reached)
+
+        clock = {"t": 0.0}
+        session = Session()
+        reader = telemetry.SessionReader(session)
+        self.assertTrue(reader.connected and reader.open())
+        tele = telemetry.Telemetry(None, "tv", CURVE, reader=reader, read_link=lambda pid, host: session.link_sample(),
+                                   clock=lambda: clock["t"], k=telemetry.NATIVE_K)
+        for i in range(1, 25):
+            clock["t"] = float(i)
+            session.pos = 100.0 + i
+            session.sent += 1_200_000
+            session.reached = int((130 + i) * MB)                                 # the TV stays 30 s ahead
+            tele.position = session.pos
+            snap = tele.step()
+        self.assertEqual((snap.tv_state, snap.tv_position), ("PLAYING", 124.0))
+        self.assertAlmostEqual(snap.buffer_s, 30.0, delta=0.1)                    # exact, not an estimate from counts
+        self.assertAlmostEqual(snap.delivered_mbps, 9.6, delta=0.3)
+        self.assertAlmostEqual(snap.needed_mbps, 8.0, delta=0.01)                 # K = 1: the file itself
+        self.assertIsNone(snap.retx_pct)
+        self.assertIsNone(snap.rtt_ms)
+        self.assertEqual(snap.verdict, "good")
+        tele.stop()                                                               # closing the adapter is a no-op
+
+    def test_a_cast_on_the_fly_reports_its_buffer_exactly(self):
+        class Session:
+            ahead, pos = 30.0, 100.0
+
+            def tv_status(self):
+                return TvStatus(self.pos, "PLAYING", 1000.0)
+
+            def link_sample(self):
+                return linkstats.LinkSample(clock["t"], 1_200_000 * int(clock["t"]), None, None, ahead=self.ahead)
+
+        clock = {"t": 0.0}
+        session = Session()
+        tele = telemetry.Telemetry(None, "tv", None, reader=telemetry.SessionReader(session),
+                                   read_link=lambda pid, host: session.link_sample(), clock=lambda: clock["t"],
+                                   k=telemetry.NATIVE_K)
+        for i in range(1, 25):
+            clock["t"] = float(i)
+            session.pos = tele.position = 100.0 + i
+            snap = tele.step()
+        self.assertEqual(snap.buffer_s, 30.0)                                     # the number the session gave, no smoothing
+        self.assertIsNone(snap.needed_mbps)                                       # no bitrate profile cast on the fly
+        self.assertAlmostEqual(snap.delivered_mbps, 9.6, delta=0.3)
+        self.assertFalse(snap.refilling)
+        self.assertEqual(snap.verdict, "good")
+        session.ahead = 3.0                                                       # the encoder cannot keep up
+        self.assertEqual(tele.step().buffer_s, 3.0)
+        self.assertEqual(tele.step().verdict, "poor")
+        session.ahead = 0.0
+        self.assertEqual(tele.step().buffer_s, 0.0)
+        session.ahead = 500.0
+        self.assertEqual(tele.step().buffer_s, telemetry.MAX_BUFFER_S)            # capped, like the estimate
+
+    def test_a_seek_on_the_fly_is_not_refilling(self):
+        """The server counts the segments the TV holds: after a jump the figure simply drops, and that is the truth."""
+        ahead = {"v": 40.0}
+        clock = {"t": 0.0}
+        tele = telemetry.Telemetry(None, "tv", CURVE, reader=self.make([(1, "PLAYING")])[0].reader,
+                                   read_link=lambda p, h: linkstats.LinkSample(clock["t"], 1, None, None, ahead=ahead["v"]),
+                                   clock=lambda: clock["t"])
+        tele.position = 100.0
+        clock["t"] = 1.0
+        self.assertEqual(tele.step().buffer_s, 40.0)
+        tele.position, ahead["v"], clock["t"] = 900.0, 0.0, 2.0                    # far jump: the estimator would re-anchor
+        snap = tele.step()
+        self.assertEqual(snap.buffer_s, 0.0)
+        self.assertFalse(snap.refilling)
+        self.assertIsNone(tele.estimator.value, "the byte-curve estimator is not used")
+
+    def test_ahead_defaults_to_none_so_the_other_samples_are_unchanged(self):
+        self.assertIsNone(linkstats.LinkSample(0.0, 1, 0, None).ahead)
+        self.assertIsNone(linkstats.LinkSample(0.0, 1, None, None, 5).ahead)
 
     def test_background_thread_updates_and_stops(self):
         tele, clock = self.make([(1, "PLAYING")])

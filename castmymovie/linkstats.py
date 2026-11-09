@@ -1,6 +1,10 @@
-"""How well is the stream getting from this Mac to the TV? Read from the operating system's TCP counters.
+"""How well is the stream getting from this Mac to the TV?
 
-macOS only for now (`nettop`). Everything degrades to "no data" elsewhere: the player simply omits the line.
+For a VLC cast this is read from the operating system's TCP counters: macOS only for now (`nettop`), and
+everything degrades to "no data" elsewhere (the player simply omits the line). A native cast serves the file
+itself, so it hands over its own byte counters instead (`NativeCast.link_sample()`), with no retransmit or
+round-trip figures: those fields are None and the player leaves them out. Cast on the fly, it also says how many
+seconds of the movie the TV has fetched ahead of where it plays (`LinkSample.ahead`).
 """
 
 from __future__ import annotations
@@ -18,8 +22,10 @@ CONTROL_PORTS = (":8008", ":8009")  # Cast HTTP + control connections, not the v
 class LinkSample:
     t: float
     bytes_out: int      # bytes handed to the TV on the stream connection(s), cumulative
-    retx: int           # of which retransmitted
+    retx: int | None    # of which retransmitted (None: not measurable)
     rtt_ms: float | None
+    offset: int | None = None  # native cast only: media bytes (past the MP4 header) the TV's download has reached
+    ahead: float | None = None  # native cast on the fly only: seconds of movie the TV has fetched past its position
 
 
 @dataclass(frozen=True)
@@ -115,5 +121,6 @@ class LinkMonitor:
         mbps = (new.bytes_out - old.bytes_out) * 8 / span / 1e6 if span >= self.MIN_RATE_SPAN else None
         old, new = self._since(self.RETX_WINDOW)
         sent = new.bytes_out - old.bytes_out
-        retx_pct = (new.retx - old.retx) / sent * 100 if sent >= 200_000 else None
+        measurable = new.retx is not None and old.retx is not None
+        retx_pct = (new.retx - old.retx) / sent * 100 if sent >= 200_000 and measurable else None
         return LinkHealth(mbps, retx_pct, new.rtt_ms)

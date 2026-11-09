@@ -7,24 +7,33 @@ About the buffer figure. Cast receivers do not report how much they have buffere
 
     buffered  ≈  (media time the bytes sent so far add up to)  -  (where the TV is now)
 
-Bytes become media time through the movie's real bitrate profile. The conversion is not exact (VLC
+Bytes become media time through the movie's real bitrate profile. With VLC the conversion is not exact (VLC
 re-muxes the stream and converts the audio), so the figure is only good to roughly +/-10 s (sometimes
 worse), and it is re-anchored whenever the truth is known: at a stall the buffer is empty, and after a seek
 the TV starts filling from scratch. Measured against a real TV, it showed a believable sawtooth that stayed
 flat while paused and stayed in a plausible band over a 5 minute run, without runaway drift.
+
+A native cast serves the file itself, so it knows exactly how far into the file the TV has downloaded; that
+offset maps straight through the bitrate profile (`BufferEstimator.update_exact`), with no byte counting and
+no drift. What is left of the error is how the file interleaves audio and video, about a second.
+
+Cast on the fly there is no file and no bitrate profile, but the server knows which segments the TV has fetched, so
+the session reports the buffer itself (`LinkSample.ahead`, in seconds) and nothing is estimated.
 """
 
 from __future__ import annotations
 
 import bisect
+import math
 import threading
 import time
 from dataclasses import dataclass
 
 from . import linkstats
-from .castlink import StatusReader
+from .castlink import StatusReader, TvStatus
 
-K = 1.05                # stream bytes per source-file byte (Matroska framing + re-encoded audio); measured on a real cast
+K = 1.05                # VLC: stream bytes per source-file byte (Matroska framing + re-encoded audio); measured on a real cast
+NATIVE_K = 1.0          # native cast: the TV downloads the file itself, byte for byte
 MAX_BUFFER_S = 120.0
 SMOOTHING = 0.35        # exponential moving average weight per update
 JUMP_S = 15.0           # a bigger position jump than this means a seek: re-anchor
@@ -62,7 +71,7 @@ class BufferEstimator:
         self.value = buffered
 
     def update(self, position: float, bytes_out: int, stalled: bool = False) -> float | None:
-        if len(self.cum) < 3:
+        if len(self.cum) < 3 or not math.isfinite(position):
             return None
         jumped = self._last_position is not None and abs(position - self._last_position) > JUMP_S
         self._last_position = position
@@ -76,6 +85,20 @@ class BufferEstimator:
         delivered = self._c_inv(self._c(self._p0) + (bytes_out - self._b0) / self.k)
         raw = min(max(delivered - position, 0.0), MAX_BUFFER_S)
         self.value = raw if self.value is None else self.value + SMOOTHING * (raw - self.value)
+        return self.value
+
+    def update_exact(self, position: float, fetched: int, stalled: bool = False) -> float | None:
+        """Native cast: `fetched` is how many media bytes (past the MP4 header) the TV's download has reached, so the
+        media time it adds up to is known outright. A seek still empties the TV's buffer: `reanchored` says so."""
+        if len(self.cum) < 3 or not math.isfinite(position):
+            return None
+        jumped = self._last_position is not None and abs(position - self._last_position) > JUMP_S
+        restarted = fetched < self._last_bytes          # a new download began further back: a seek
+        self._last_position, self._last_bytes = position, fetched
+        self.reanchored = self.value is not None and (jumped or restarted or stalled)
+        raw = 0.0 if stalled else min(max(self._c_inv(fetched / self.k) - position, 0.0), MAX_BUFFER_S)
+        smooth = self.value is not None and not self.reanchored and not stalled
+        self.value = self.value + SMOOTHING * (raw - self.value) if smooth else raw
         return self.value
 
 
@@ -105,19 +128,40 @@ class Snapshot:
         return "good"
 
 
+class SessionReader:
+    """Gives Telemetry the TV status a native cast already has, through the StatusReader interface, so that no
+    second Cast connection is opened next to the one that is driving the TV."""
+
+    def __init__(self, session):
+        self.session = session
+        self.connected = True
+
+    def open(self, timeout: float = 0.0) -> bool:
+        return True
+
+    def poll(self) -> TvStatus | None:
+        return self.session.tv_status()
+
+    def close(self) -> None:
+        pass
+
+
 class Telemetry:
-    """Samples once a second on a background thread so the player's keys stay responsive."""
+    """Samples once a second on a background thread so the player's keys stay responsive.
+
+    For VLC it reads the TV with its own StatusReader and the link with nettop on VLC's `pid`; a native cast
+    passes `reader=SessionReader(session)`, `read_link` from the session's own counters and `k=NATIVE_K`."""
 
     INTERVAL = 1.0
     RECONNECT_EVERY = 10.0
 
-    def __init__(self, pid: int, host: str, curve: list | None = None, reader=None,
-                 read_link=linkstats.read_sample, clock=time.monotonic):
-        self.pid, self.host, self.curve = pid, host, curve or []
+    def __init__(self, pid: int | None, host: str, curve: list | None = None, reader=None,
+                 read_link=linkstats.read_sample, clock=time.monotonic, k: float = K):
+        self.pid, self.host, self.curve, self.k = pid, host, curve or [], k
         self.reader = reader if reader is not None else StatusReader(host)
         self.read_link, self.clock = read_link, clock
         self.link = linkstats.LinkMonitor()
-        self.estimator = BufferEstimator(self.curve) if len(self.curve) >= 3 else None
+        self.estimator = BufferEstimator(self.curve, k) if len(self.curve) >= 3 else None
         self.position = 0.0            # set by the player on every tick
         self.latest = Snapshot()
         self._began = False
@@ -142,7 +186,14 @@ class Telemetry:
         position = self.position
         stalled = bool(tv and tv.state == "BUFFERING")
         buffer_s = None
-        if self.estimator and sample:
+        on_the_fly = sample is not None and sample.ahead is not None
+        if on_the_fly:   # the segments the TV has fetched, counted by the server: exact, and a seek needs no re-anchoring
+            buffer_s = min(max(sample.ahead, 0.0), MAX_BUFFER_S)
+        elif self.estimator and sample and sample.offset is not None:
+            buffer_s = self.estimator.update_exact(position, sample.offset, stalled)
+            if self.estimator.reanchored:
+                self._refill_until = now + REFILL_S
+        elif self.estimator and sample:
             if not self._began and tv and tv.position is not None:
                 self.estimator.begin(position - tv.position)   # stream start = now minus how far the TV has played
                 self._began = True
@@ -156,12 +207,12 @@ class Telemetry:
         if len(self.curve) >= 3:
             i, j = int(min(position, len(self.curve) - 2)), int(min(position + 10, len(self.curve) - 1))
             if j > i:
-                needed = (self.curve[j] - self.curve[i]) * 8 / (j - i) / 1e6 * K
+                needed = (self.curve[j] - self.curve[i]) * 8 / (j - i) / 1e6 * self.k
         self.latest = Snapshot(
             tv_state=tv.state if tv else None, tv_position=tv.position if tv else None, buffer_s=buffer_s,
             delivered_mbps=health.delivered_mbps if health else None, needed_mbps=needed,
             retx_pct=health.retx_pct if health else None, rtt_ms=health.rtt_ms if health else None,
-            refilling=now < self._refill_until and not stalled and (buffer_s or 0) < 30)
+            refilling=not on_the_fly and now < self._refill_until and not stalled and (buffer_s or 0) < 30)
         return self.latest
 
     # --- background thread

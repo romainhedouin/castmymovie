@@ -45,6 +45,9 @@ while True:
     while b"\n" in buf:
         line, buf = buf.split(b"\n", 1)
         cmd = line.decode().strip()
+        slow = os.environ["FAKE_ARGS_FILE"] + ".slow"
+        if cmd == "get_time" and os.path.exists(slow):
+            os.remove(slow); time.sleep(2.2)   # a busy VLC answers late, once
         if cmd == "get_time": c.sendall(b"\r\n> " if ended() else ("%%d\r\n> " %% st["t"]).encode())
         elif cmd == "get_length": c.sendall(("%%d\r\n> " %% st["len"]).encode())
         elif cmd == "is_playing": c.sendall(b"1\r\n> " if st["playing"] and not ended() else b"0\r\n> ")
@@ -167,6 +170,14 @@ class Session(unittest.TestCase):
         s.state()
         s.seek_by(30)
         self.assertGreaterEqual(s.state().position, 230)
+
+    def test_a_late_reply_is_not_taken_for_the_next_answer(self):
+        s = self.make()
+        s.start(timeout=15)
+        Path(str(self.args_file) + ".slow").touch()
+        self.assertIsNone(s._number("get_time"))           # VLC is too slow: no answer inside the read timeout
+        self.assertEqual(s._number("get_length"), 600)     # and the late time must not pass for the length
+        self.assertGreaterEqual(s._number("get_time"), 0)
 
     def test_stalled_playback_is_reported_as_buffering(self):
         s = self.make()

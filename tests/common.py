@@ -35,6 +35,10 @@ def fixtures() -> Path:
     d, src = _dir, video_src() + audio_src()
     ff(*src, *H264, *AAC, "-movflags", "+faststart", str(d / "good.mp4"))
     ff(*src, *H264, *AAC, str(d / "nofaststart.mp4"))
+    # otherwise ready, but VLC cannot pass this audio through to a TV: it would have to convert it live
+    ff(*src, *H264, "-c:a", "aac", "-ac", "6", "-b:a", "384k", "-movflags", "+faststart", str(d / "aac51.mp4"))
+    ff(*src, *H264, "-c:a", "libmp3lame", "-b:a", "128k", "-movflags", "+faststart", str(d / "mp3.mp4"))
+    ff(*src, *H264, "-c:a", "libopus", "-b:a", "96k", "-movflags", "+faststart", str(d / "opus.mp4"))
     ff(*src, *H264, *AAC, str(d / "plain.mkv"))
     ff(*src, "-c:v", "libx265", "-x265-params", "log-level=error", "-pix_fmt", "yuv420p", "-crf", "28",
        "-c:a", "ac3", "-ac", "6", "-b:a", "384k", str(d / "hevc_ac3.mkv"))
