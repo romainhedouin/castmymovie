@@ -1,10 +1,8 @@
 """Cast natively: this Mac serves the movie over HTTP and the TV's own media player plays it.
 
-Why not VLC. VLC sends the TV a *live* stream (re-muxed on the fly), and when the TV stalls on it VLC rewinds
-to where the stream began and switches to live video transcoding: on a weak Wi-Fi the picture freezes while
-the sound goes on. Here the TV is handed an ordinary file (`streamType: BUFFERED`): it downloads ahead,
-pauses and rebuffers both tracks together when the Wi-Fi dips, and seeks with HTTP Range requests, exactly
-as it would with a movie from any web server.
+The TV is handed an ordinary file (`streamType: BUFFERED`): it downloads ahead, pauses and rebuffers both tracks
+together when the Wi-Fi dips, and seeks with HTTP Range requests, exactly as it would with a movie from any web
+server. (A live stream would freeze the picture while the sound goes on when a weak Wi-Fi stalls.)
 
 How:
   1. `MediaServer` serves the prepared .cast.mp4 to the TV's address only, under a random URL.
@@ -14,7 +12,7 @@ How:
      status, runs the player's commands (they are queued, never sent from the UI thread), and saves the cast
      when something goes wrong.
 
-Recovery, which is the point of this backend:
+Recovery, which is the point of this design:
   - The control connection drops or goes silent for 15 s: reconnect with backoff (1, 2, 4, 8... s). If the TV
     is still playing our movie, re-attach without touching playback.
   - The TV reports a playback error (IDLE + ERROR), forgets the movie, or its player is gone when we come
@@ -93,7 +91,7 @@ def _running_apps(status: dict) -> list:
 
 class SessionLog:
     """The native cast's diary, one timestamped line per event. Thread-safe, flushed line by line, overwritten
-    by the next cast (like VLC's log). Only this user can read it, it stops growing at MAX_BYTES, and when it
+    by the next cast. Only this user can read it, it stops growing at MAX_BYTES, and when it
     cannot be opened or written the cast simply runs without it."""
 
     MAX_LINE = 4000
@@ -429,7 +427,7 @@ class NativeCast:
         if self.server is None or self.server.media_requests == 0:
             return f"{name} could not load the movie ({detail}) and never downloaded any of it. {self._firewall_hint()}"
         return (f"{name} could not play this movie ({detail}). It did download part of it, so the network is fine: "
-                "the TV probably cannot decode this video or audio format. Try casting it with VLC instead.")
+                "the TV probably cannot decode this video or audio format.")
 
     def _firewall_hint(self) -> str:
         refused = sorted(self.server.refused) if self.server else []

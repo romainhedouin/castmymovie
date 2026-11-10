@@ -41,11 +41,6 @@ HEVC_MAX_LEVEL = 153
 HEVC_PIX_FMTS = {"yuv420p", "yuv420p10le"}
 AAC_PROFILES = {"LC", "HE-AAC", "HE-AACv2"}
 MP4_AUDIO = {"aac", "mp3", "opus", "flac"}  # what a Cast TV plays itself from an MP4, up to 5.1
-# VLC hands only AAC (up to stereo) and Opus to the TV untouched. Everything else (5.1 AAC, MP3, FLAC, AC-3, ...) it
-# decodes and re-encodes live inside the cast, and that live transcode is the fragile part of a stream, so when the
-# movie is meant for VLC (`analyze(..., for_vlc=True)`) such audio is converted up front, where there is no deadline.
-VLC_AUDIO = {"aac", "opus"}
-VLC_MAX_CH = 2
 WEBM_AUDIO = {"opus", "vorbis"}
 TEXT_SUBS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
 BITMAP_SUBS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"}
@@ -212,22 +207,6 @@ def mdat_offset(path: Path) -> int | None:
     return next((at for kind, at in mp4_boxes(path) if kind == "mdat"), None)
 
 
-def vlc_audio_issue(path: Path) -> str | None:
-    """Why VLC would have to convert this file's audio live while casting, or None if it passes it through."""
-    try:
-        audio = next((s for s in probe(path)["streams"] if s["codec_type"] == "audio"), None)
-    except (CastError, ValueError, KeyError):
-        return None
-    if audio is None:
-        return None
-    codec, ch = audio.get("codec_name", "unknown"), int(audio.get("channels", 2) or 2)
-    if codec not in VLC_AUDIO:
-        return f"{codec.upper()} audio"
-    if ch > VLC_MAX_CH:
-        return f"{audio.get('channel_layout') or f'{ch}-channel'} {codec.upper()} audio"
-    return None
-
-
 def chrome_major() -> int | None:
     candidates = [
         ("plist", "/Applications/Google Chrome.app/Contents/Info.plist"),
@@ -370,9 +349,8 @@ def pick_audio(audios: list, lang: str | None) -> dict | None:
 
 
 def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = False,
-            lang: str | None = None, audio_index: int | None = None, for_vlc: bool = False) -> Analysis:
-    """What the file needs. `for_vlc` adds VLC's own audio limits (see VLC_AUDIO); the default is for a TV that
-    plays the file itself, which the native cast does."""
+            lang: str | None = None, audio_index: int | None = None) -> Analysis:
+    """What the file needs to play on a TV that plays the file itself."""
     path, info, stats, duration = sc.path, sc.info, sc.stats, sc.duration
     v, audios, subs = sc.video, sc.audios, sc.subtitles
     a = next((x for x in audios if x["index"] == audio_index), None) if audio_index is not None \
@@ -459,22 +437,19 @@ def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = Fal
     else:
         acodec, ach = a.get("codec_name", "unknown"), int(a.get("channels", 2) or 2)
         lang_tag = a.get("tags", {}).get("language", "und")
-        allowed = WEBM_AUDIO if is_webm else VLC_AUDIO if for_vlc else MP4_AUDIO
+        allowed = WEBM_AUDIO if is_webm else MP4_AUDIO
         awhy: list[str] = []
         if acodec not in allowed:
-            awhy.append(f"{acodec.upper()} would be converted live while casting" if for_vlc
-                        else f"{acodec.upper()} is not playable in Chrome here" if acodec in ("ac3", "eac3", "dts", "truehd")
+            awhy.append(f"{acodec.upper()} is not playable in Chrome here" if acodec in ("ac3", "eac3", "dts", "truehd")
                         else f"{acodec} is not supported")
         elif acodec == "aac" and a.get("profile") not in AAC_PROFILES:
             awhy.append(f"AAC {a.get('profile')} is not supported")
-        elif for_vlc and acodec == "aac" and ach > VLC_MAX_CH:
-            awhy.append(f"{ach} channels would be downmixed live while casting")
         if ach > 6:
             awhy.append(f"{ach} channels (max 5.1)")
         layout = a.get("channel_layout", f"{ach}ch")
         checks.append(Check("Audio", not awhy,
                             f"{acodec.upper()} {layout} [{lang_tag}]" + ("" if not awhy else f": {'; '.join(awhy)}")))
-        plan.audio_ch = min(ach, VLC_MAX_CH if for_vlc else 6)  # what a re-encode produces
+        plan.audio_ch = min(ach, 6)  # what a re-encode produces
         if awhy:
             plan.audio, plan.audio_why = "encode", awhy
             plan.audio_out_kbps = 384 if plan.audio_ch > 2 else 192 if plan.audio_ch == 2 else 96
@@ -484,7 +459,7 @@ def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = Fal
         if len(audios) > 1:
             others = ", ".join(f"#{x['index']} {x.get('tags', {}).get('language', 'und')}" for x in audios if x is not a)
             checks.append(Check("Audio tracks", None, f"{len(audios)} found, using #{a['index']} [{lang_tag}] (ignored: {others})"))
-            # the TV (and VLC) play the file's default track, so the pick only holds if the other tracks leave the file
+            # the TV plays the file's default track, so the pick only holds if the other tracks leave the file
             plan.remux = True
             plan.container_why.append(f"keep only audio track #{a['index']}")
 
@@ -515,7 +490,7 @@ def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = Fal
         plan.video, plan.video_why = "encode", ["repackaging VP9 as MP4: encode to H.264"]
     if plan.video == "encode":
         plan.remux = True
-    if a is not None and plan.audio == "copy" and plan.changes and acodec not in (VLC_AUDIO if for_vlc else MP4_AUDIO):
+    if a is not None and plan.audio == "copy" and plan.changes and acodec not in MP4_AUDIO:
         # a rewritten file is always MP4, so audio that only WebM allows (Vorbis) has to be converted
         plan.audio, plan.audio_why = "encode", [f"{acodec} is not supported in MP4"]
         plan.audio_out_kbps = 384 if plan.audio_ch > 2 else 192 if plan.audio_ch == 2 else 96

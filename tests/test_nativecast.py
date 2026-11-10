@@ -214,7 +214,8 @@ class Start(Base):
             self.session(fake).start(timeout=5)
         msg = str(cm.exception)
         self.assertIn("could not play this movie (LOAD_FAILED 104)", msg)
-        self.assertIn("VLC", msg)
+        self.assertIn("the TV probably cannot decode this video or audio format", msg)
+        self.assertNotIn("VLC", msg)
 
     def test_a_tv_that_never_comes_to_download_explains_the_firewall(self):
         fake = self.fake(fetch=False)
@@ -677,8 +678,8 @@ class Recovery(Base):
 
 
 class Interface(unittest.TestCase):
-    def test_both_backends_offer_the_session_interface(self):
-        for cls in (cast.VlcCast, nativecast.NativeCast):
+    def test_the_cast_offers_the_session_interface(self):
+        for cls in (nativecast.NativeCast,):
             for name in ("start", "stop", "state", "toggle_pause", "seek_to", "seek_by", "__enter__", "__exit__"):
                 self.assertTrue(callable(getattr(cls, name, None)), f"{cls.__name__}.{name}")
         for name in ("tv_status", "link_sample", "encoder_status"):

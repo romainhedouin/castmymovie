@@ -13,7 +13,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from castmymovie import cast, castlink, engine, nativecast, telemetry, ui  # noqa: E402
 from castmymovie.castlink import MEDIA_NS, num  # noqa: E402
-from test_castlink import FakeTV, reader_for  # noqa: E402
 from test_nativecast import Base, QuickCast  # noqa: E402
 
 NAN, INF = float("nan"), float("inf")
@@ -152,10 +151,6 @@ class Formatting(unittest.TestCase):
             self.assertIsNone(e.update_exact(value, 41_000))
         self.assertAlmostEqual(e.update_exact(11.0, 41_000), 30.0, delta=1)
         self.assertTrue(math.isfinite(e.value))
-        e = telemetry.BufferEstimator(CURVE, k=1.0)
-        e.begin(0.0)
-        self.assertIsNone(e.update(NAN, 40_000))
-        self.assertAlmostEqual(e.update(10.0, 40_000), 30.0)
 
     def test_the_buffer_row_is_left_out_for_a_non_finite_buffer(self):
         w, _ = make_wizard()
@@ -171,34 +166,6 @@ class Formatting(unittest.TestCase):
             st = cast.PlayState(value, 600.0, False, False, True)
             w.console.print(w.render_cast(st, rec, Path("movie.mp4"), True, snap, telemetry_on=True))
         self.assertIn("Casting to TV", out.getvalue())
-
-
-class StatusReaderOdd(unittest.TestCase):
-    """The reader VLC casts use passes the TV's numbers on to the telemetry."""
-
-    def test_odd_numbers_become_none(self):
-        class OddTV(FakeTV):
-            odd = {}
-
-            def _reply(self, conn, src, ns, payload):
-                if payload.get("type") == "MEDIA_STATUS":
-                    payload["status"][0].update(self.odd)
-                super()._reply(conn, src, ns, payload)
-
-        tv = OddTV()
-        self.addCleanup(tv.close)
-        r = reader_for(tv)
-        self.addCleanup(r.close)
-        self.assertTrue(r.open(timeout=3))
-        for label, value in ODD:
-            with self.subTest(label):
-                tv.odd = {"currentTime": value, "media": {"duration": value}}
-                st = r.poll()
-                self.assertEqual(st.state, "PLAYING")
-                for got in (st.position, st.duration):
-                    self.assertTrue(got is None or sane(got, 1e6), got)
-        tv.odd = {}
-        self.assertEqual(r.poll().duration, 600.0)
 
 
 class OnTheWire(Base):

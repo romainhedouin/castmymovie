@@ -100,12 +100,6 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual((v["codec_name"], v["codec_tag_string"]), ("hevc", "hvc1"))
         self.assertEqual((a["codec_name"], a["channels"]), ("aac", 6))          # the TV plays 5.1 AAC itself
 
-    @unittest.skipUnless(sys.platform == "darwin", "HEVC is only trusted on macOS")
-    def test_hevc_for_vlc_gets_stereo(self):
-        sc, an, out = pipeline(self.d / "hevc_ac3.mkv", for_vlc=True)
-        a = streams(out.video, "audio")[0]
-        self.assertEqual((a["codec_name"], a["channels"]), ("aac", 2))           # VLC passes stereo AAC through
-
     def test_force_h264(self):
         sc, an, out = pipeline(self.d / "hevc_ac3.mkv", force_h264=True)
         self.assertEqual(streams(out.video, "video")[0]["codec_name"], "h264")
@@ -228,37 +222,15 @@ class EndToEnd(unittest.TestCase):
         sc = engine.scan(self.d / "dual_aac.mp4")
         fra = next(a for a in sc.audios if a["tags"]["language"] == "fra")
         an = engine.analyze(sc, audio_index=fra["index"])
-        self.assertEqual(an.plan.mode, "remux")           # otherwise VLC plays the file's default track
+        self.assertEqual(an.plan.mode, "remux")           # otherwise the file's default track plays
         out = engine.convert(sc, an)
         got = streams(out.video, "audio")
         self.assertEqual((len(got), got[0]["tags"].get("language")), (1, "fra"))
 
-    def test_audio_vlc_cannot_pass_through_is_converted_up_front(self):
-        for name, why in (("aac51.mp4", "6 channels"), ("mp3.mp4", "MP3")):
-            sc = engine.scan(self.d / name)
-            an = engine.analyze(sc, for_vlc=True)
-            self.assertEqual((an.plan.video, an.plan.audio, an.plan.mode), ("copy", "encode", "re-encode"), name)
-            self.assertIn(why, " ".join(an.plan.audio_why))
-            out = engine.convert(sc, an)
-            a = streams(out.video, "audio")[0]
-            self.assertEqual((a["codec_name"], a["channels"]), ("aac", 1 if name == "mp3.mp4" else 2), name)
-            self.assertTrue(out.verification.ok, out.verification.problems)
-
-    def test_audio_vlc_passes_through_is_left_alone(self):
-        for name in ("good.mp4", "opus.mp4"):
-            self.assertFalse(engine.analyze(engine.scan(self.d / name), for_vlc=True).plan.changes, name)
-
-    def test_the_vlc_audio_rule_does_not_apply_to_the_default_native_cast(self):
+    def test_audio_a_tv_decodes_itself_is_left_alone(self):
         for name in ("aac51.mp4", "mp3.mp4", "good.mp4", "opus.mp4"):  # a TV decodes all of these itself
             self.assertFalse(engine.analyze(engine.scan(self.d / name)).plan.changes, name)
         self.assertEqual(engine.analyze(engine.scan(self.d / "hevc_ac3.mkv")).plan.audio, "encode")  # AC-3: still
-
-    def test_vlc_audio_issue_names_what_vlc_would_convert(self):
-        self.assertIn("5.1", engine.vlc_audio_issue(self.d / "aac51.mp4"))
-        self.assertIn("MP3", engine.vlc_audio_issue(self.d / "mp3.mp4"))
-        self.assertIsNone(engine.vlc_audio_issue(self.d / "good.mp4"))
-        self.assertIsNone(engine.vlc_audio_issue(self.d / "opus.mp4"))
-        self.assertIsNone(engine.vlc_audio_issue(self.d / "missing.mp4"))      # unreadable: no warning, no crash
 
     def test_mdat_offset_points_at_the_media_data(self):
         off = engine.mdat_offset(self.d / "good.mp4")

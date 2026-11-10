@@ -101,7 +101,7 @@ class KeyPresses(unittest.TestCase):
         return [keys.read(0.2) for _ in range(count)]
 
     def test_presses_that_arrive_together_are_read_one_by_one(self):
-        # key repeat, or a loop busy with a slow VLC reply, delivers several presses in a single read
+        # key repeat, or a loop busy with a slow TV reply, delivers several presses in a single read
         right = b"\x1b[C"
         self.assertEqual(self.read_all(right * 3 + b"q", 5), ["right", "right", "right", "q", None])
         self.assertEqual(self.read_all(right + b"q", 3), ["right", "q", None])

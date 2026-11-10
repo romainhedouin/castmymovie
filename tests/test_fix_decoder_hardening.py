@@ -221,16 +221,6 @@ class Reader(Plumbing):
         self.assertEqual(m.type, "X")
         self.assertFalse(conn._buf)
 
-    def test_the_status_reader_gives_up_quietly_on_a_hostile_tv(self):
-        srv = RawServer(struct.pack(">I", 0xFFFFFFFF))
-        self.addCleanup(srv.close)
-        reader = castlink.StatusReader("127.0.0.1", srv.port, tls=False)
-        started = time.monotonic()
-        self.assertFalse(reader.open(timeout=2))
-        self.assertLess(time.monotonic() - started, 1.5)
-        self.assertFalse(reader.connected)
-        self.assertIsNone(reader.poll())
-
 
 class Injector(FakeReceiver):
     def inject(self, raw):

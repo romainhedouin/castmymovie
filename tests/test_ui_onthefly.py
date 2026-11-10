@@ -12,7 +12,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from castmymovie import engine, ui  # noqa: E402
 from common import HAVE_FFMPEG, fixtures  # noqa: E402
-from test_ui import TV, FakeCaster, FakeNative, Script, found, make_wizard  # noqa: E402
+from test_ui import TV, FakeNative, Script, found, make_wizard  # noqa: E402
 
 Status = namedtuple("Status", "frontier_s speed slow")
 WHEN = "When should the movie start playing?"
@@ -77,7 +77,7 @@ class Question(unittest.TestCase):
 
     def test_a_video_re_encode_asks_and_convert_first_is_the_default(self):
         src = self.d / "burst.mkv"
-        script = Script(src, WEAK, "full", None, False)
+        script = Script(src, WEAK, "full", False, False)
         w, out = make_wizard(script, found=[found(src)])
         self.assertEqual(w.run(), 0)
         self.assertEqual(script.choices[WHEN], ["Convert first, then play (recommended)",
@@ -131,7 +131,7 @@ class Question(unittest.TestCase):
     def test_on_the_fly_goes_through_run_to_the_cast_step(self):
         src = self.d / "burst.mkv"
         made = FakeStreamOutcome(video=src)
-        script = Script(src, WEAK, "otf", "native", TV, "", "done", False)
+        script = Script(src, WEAK, "otf", True, TV, "", "done", False)
         w, out = make_wizard(script, found=[found(src)], stream_prepare=lambda sc, an, progress: made)
         self.assertEqual(w.run(), 0)
         self.assertIs(FakeNative.instances[0].stream, made.streams[0])
@@ -162,23 +162,23 @@ class Question(unittest.TestCase):
 
 
 class StreamingCast(unittest.TestCase):
-    def cast(self, *answers, outcome=None, vlc="/fake/VLC", keys=("q",)):
+    def cast(self, *answers, outcome=None, keys=("q",)):
         outcome = outcome or FakeStreamOutcome()
         script = Script(*answers)
-        w, out = make_wizard(script, vlc=vlc, keys=keys)
+        w, out = make_wizard(script, keys=keys)
         return w, out, script, outcome
 
-    def test_only_the_native_cast_is_offered_even_when_vlc_is_installed(self):
-        w, out, script, outcome = self.cast("native", TV, "", "done")
+    def test_the_cast_question_is_a_confirm_and_the_way_out_is_offered(self):
+        w, out, script, outcome = self.cast(True, TV, "", "done")
         w.offer_cast(outcome)
-        self.assertEqual(script.choices["Play it on your TV now?"], ["Cast it to your TV (recommended)", "Not now"])
+        self.assertIn("Play it on your TV now?", script.asked)
+        self.assertNotIn("Play it on your TV now?", script.choices)     # a confirm, not a select
         self.assertEqual(script.choices["What next?"], ["Cast it again", "Convert it fully, then cast (slower, reliable)",
                                                         "Choose another TV", "Done with this movie"])
-        self.assertEqual(FakeCaster.instances, [])
         self.assertNotIn("VLC", out.getvalue())
 
     def test_the_session_gets_a_stream_and_the_source_for_its_title(self):
-        w, out, script, outcome = self.cast("native", TV, "0:30", "done")
+        w, out, script, outcome = self.cast(True, TV, "0:30", "done")
         w.offer_cast(outcome)
         session, = FakeNative.instances
         self.assertEqual(session.args, (TV, outcome.video, 30.0))
@@ -187,7 +187,7 @@ class StreamingCast(unittest.TestCase):
         self.assertEqual(session.calls, ["stop"])
 
     def test_every_attempt_gets_a_new_stream(self):
-        w, _, script, outcome = self.cast("native", TV, "", "again", "", "again", "", "done")
+        w, _, script, outcome = self.cast(True, TV, "", "again", "", "again", "", "done")
         w.offer_cast(outcome)
         self.assertEqual(len(FakeNative.instances), 3)
         self.assertEqual(len(outcome.streams), 3)
@@ -197,53 +197,52 @@ class StreamingCast(unittest.TestCase):
 
     def test_subtitles_are_still_offered(self):
         vtt = Path("/movies/Big Movie.cast.eng.vtt")
-        w, _, script, outcome = self.cast("native", TV, vtt, "", "done", outcome=FakeStreamOutcome(subtitles=[vtt]))
+        w, _, script, outcome = self.cast(True, TV, vtt, "", "done", outcome=FakeStreamOutcome(subtitles=[vtt]))
         w.offer_cast(outcome)
         self.assertEqual(FakeNative.instances[0].subtitles, [vtt])
 
     def test_cleanup_when_the_movie_is_done(self):
-        w, _, _, outcome = self.cast("native", TV, "", "done")
+        w, _, _, outcome = self.cast(True, TV, "", "done")
         w.offer_cast(outcome)
         self.assertGreaterEqual(outcome.cleaned, 1)
 
     def test_cleanup_when_not_casting_at_all(self):
-        w, _, _, outcome = self.cast(None)
+        w, _, _, outcome = self.cast(False)
         w.offer_cast(outcome)
         self.assertEqual((outcome.cleaned, FakeNative.instances), (1, []))
-        w, _, _, outcome = self.cast("native", None)    # no TV picked
+        w, _, _, outcome = self.cast(True, None)    # no TV picked
         w.offer_cast(outcome)
         self.assertEqual(outcome.cleaned, 1)
 
     def test_cleanup_after_a_failed_start_and_the_fully_converted_way_out_is_the_default(self):
-        w, out, script, outcome = self.cast("native", TV, "", "done")
+        w, out, script, outcome = self.cast(True, TV, "", "done")
         FakeNative.fail = True
         w.offer_cast(outcome)
         self.assertIn("firewall", out.getvalue())
         self.assertEqual(script.defaults["What next?"], ["full"])
         self.assertEqual(FakeNative.instances[0].calls, ["stop"])
-        self.assertEqual(FakeCaster.instances, [])      # no VLC fallback, even though it is installed
         self.assertNotIn("Try with VLC", script.choices["What next?"])
         self.assertGreaterEqual(outcome.cleaned, 1)
 
     def test_the_default_after_a_good_cast_is_to_cast_again(self):
-        w, _, script, outcome = self.cast("native", TV, "", "done")
+        w, _, script, outcome = self.cast(True, TV, "", "done")
         w.offer_cast(outcome)
         self.assertEqual(script.defaults["What next?"], ["again"])
 
     def test_cleanup_on_ctrl_c_at_a_prompt(self):
-        w, _, _, outcome = self.cast("native", TV, "", "KeyboardInterrupt")
+        w, _, _, outcome = self.cast(True, TV, "", "KeyboardInterrupt")
         with self.assertRaises(KeyboardInterrupt):
             w.offer_cast(outcome)
         self.assertGreaterEqual(outcome.cleaned, 1)
 
     def test_cleanup_on_ctrl_c_while_starting_and_while_playing(self):
-        w, _, _, outcome = self.cast("native", TV, "")
+        w, _, _, outcome = self.cast(True, TV, "")
         with mock.patch.object(FakeNative, "start", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 w.offer_cast(outcome)
         self.assertEqual(FakeNative.instances[0].calls, ["stop"])
         self.assertEqual(outcome.cleaned, 1)
-        w, _, _, outcome = self.cast("native", TV, "")
+        w, _, _, outcome = self.cast(True, TV, "")
         with mock.patch.object(FakeNative, "state", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 w.offer_cast(outcome)
@@ -251,21 +250,20 @@ class StreamingCast(unittest.TestCase):
         self.assertEqual(outcome.cleaned, 1)
 
     def test_cleanup_when_something_unexpected_blows_up(self):
-        w, _, _, outcome = self.cast("native", TV, "")
+        w, _, _, outcome = self.cast(True, TV, "")
         with mock.patch.object(FakeNative, "state", side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError):
                 w.offer_cast(outcome)
         self.assertEqual(outcome.cleaned, 1)
 
-    def test_an_ordinary_outcome_is_untouched_and_keeps_vlc(self):
-        # a converted file has no on_the_fly marker: nothing to clean up, no stream argument, VLC offered as before
+    def test_an_ordinary_outcome_is_untouched(self):
+        # a converted file has no on_the_fly marker: nothing to clean up, no stream argument, no way out offered
         with tempfile.TemporaryDirectory() as tmp:
             video = Path(tmp) / "m.cast.mp4"
             video.write_bytes(b"x")
             outcome = engine.Outcome(video, True, None, [], 1.0, None, 600.0)
-            w, _, script, _ = self.cast("native", TV, "", "done")
+            w, _, script, _ = self.cast(True, TV, "", "done")
             w.offer_cast(outcome)
-            self.assertIn("Cast it with VLC instead", script.choices["Play it on your TV now?"])
             self.assertNotIn("Convert it fully, then cast (slower, reliable)", script.choices["What next?"])
             self.assertIsNone(FakeNative.instances[0].stream)
 
@@ -289,7 +287,7 @@ class FullFallback(unittest.TestCase):
         return w, out, script, outcome, convert
 
     def test_converting_fully_then_casting_the_file(self):
-        w, out, script, outcome, convert = self.run_flow("native", TV, "", "full", "", "done")
+        w, out, script, outcome, convert = self.run_flow(True, TV, "", "full", "", "done")
         convert.assert_called_once_with(mock.sentinel.scan, mock.sentinel.analysis, w.bar)
         self.assertEqual(script.asked.count("Play it on your TV now?"), 1)     # no starting over
         self.assertEqual(script.asked.count("Which TV?"), 1)
@@ -301,18 +299,15 @@ class FullFallback(unittest.TestCase):
         self.assertEqual(len(outcome.streams), 1)
         self.assertGreaterEqual(outcome.cleaned, 1)
         self.assertIn("done in 00:42", out.getvalue())                         # the usual "Ready" panel
-        # it is an ordinary file now: VLC is back and the way out is gone
-        second_menu = script.offered["What next?"][1]
-        self.assertIn("Cast it with VLC instead", second_menu)
-        self.assertNotIn("Convert it fully, then cast (slower, reliable)", second_menu)
-        self.assertEqual(FakeCaster.instances, [])
+        # it is an ordinary file now: the way out is gone
+        self.assertNotIn("Convert it fully, then cast (slower, reliable)", script.offered["What next?"][1])
 
     def test_the_stream_is_cleaned_before_the_converted_file_is_cast(self):
         order = []
         w, out, script, outcome, _ = None, None, None, None, None
         outcome = FakeStreamOutcome(scan=1, analysis=2)
         outcome.cleanup = lambda: order.append("cleanup")
-        script = Script("native", TV, "", "full", "", "done")
+        script = Script(True, TV, "", "full", "", "done")
         w, out = make_wizard(script)
         with mock.patch.object(ui.engine, "convert", return_value=self.converted), \
                 mock.patch.object(FakeNative, "start", lambda self: order.append(("cast", self.args[1].name))):
@@ -323,7 +318,7 @@ class FullFallback(unittest.TestCase):
         exists = engine.OutputExists(self.video)
         convert = mock.Mock(side_effect=[exists])
         reuse = mock.Mock(return_value=self.converted)
-        w, out, script, outcome, _ = self.run_flow("native", TV, "", "full", "use", "", "done",
+        w, out, script, outcome, _ = self.run_flow(True, TV, "", "full", "use", "", "done",
                                                    convert=convert, reuse=reuse)
         self.assertIn("Big Movie.cast.mp4 already exists.", script.asked)
         reuse.assert_called_once_with(mock.sentinel.scan, mock.sentinel.analysis, w.bar)
@@ -331,20 +326,20 @@ class FullFallback(unittest.TestCase):
 
     def test_an_existing_converted_file_can_be_overwritten(self):
         convert = mock.Mock(side_effect=[engine.OutputExists(self.video), self.converted])
-        w, out, script, outcome, _ = self.run_flow("native", TV, "", "full", "redo", "", "done", convert=convert)
+        w, out, script, outcome, _ = self.run_flow(True, TV, "", "full", "redo", "", "done", convert=convert)
         self.assertEqual(convert.call_args_list[1].kwargs, {"overwrite": True})
         self.assertEqual(FakeNative.instances[1].args[1], self.video)
 
     def test_cancelling_the_overwrite_question_stays_on_the_fly(self):
         convert = mock.Mock(side_effect=[engine.OutputExists(self.video)])
-        w, out, script, outcome, _ = self.run_flow("native", TV, "", "full", "cancel", "", "done", convert=convert)
+        w, out, script, outcome, _ = self.run_flow(True, TV, "", "full", "cancel", "", "done", convert=convert)
         self.assertEqual(len(FakeNative.instances), 2)
         self.assertIs(FakeNative.instances[1].stream, outcome.streams[1])      # still on the fly, a fresh encoder
         self.assertIn("Convert it fully, then cast (slower, reliable)", script.offered["What next?"][1])
 
     def test_a_failed_conversion_is_reported_and_the_cast_goes_on(self):
         convert = mock.Mock(side_effect=engine.CastError("not enough disk space: need ~9 GB, have 1 GB"))
-        w, out, script, outcome, _ = self.run_flow("native", TV, "", "full", "", "done", convert=convert)
+        w, out, script, outcome, _ = self.run_flow(True, TV, "", "full", "", "done", convert=convert)
         self.assertIn("not enough disk space", out.getvalue())
         self.assertEqual(len(FakeNative.instances), 2)
         self.assertIsNotNone(FakeNative.instances[1].stream)
@@ -352,7 +347,7 @@ class FullFallback(unittest.TestCase):
     def test_ctrl_c_during_the_conversion_cleans_up(self):
         convert = mock.Mock(side_effect=KeyboardInterrupt)
         outcome = FakeStreamOutcome()
-        w, _ = make_wizard(Script("native", TV, "", "full"))
+        w, _ = make_wizard(Script(True, TV, "", "full"))
         with mock.patch.object(ui.engine, "convert", convert):
             with self.assertRaises(KeyboardInterrupt):
                 w.offer_cast(outcome)
@@ -367,7 +362,7 @@ class FullFallbackForReal(unittest.TestCase):
         sc = engine.scan(src)
         an = engine.analyze(sc, WEAK)
         outcome = FakeStreamOutcome(video=src, duration=sc.duration, scan=sc, analysis=an)
-        w, out = make_wizard(Script("native", TV, "", "full", "", "done"))
+        w, out = make_wizard(Script(True, TV, "", "full", "", "done"))
         try:
             w.offer_cast(outcome)
             self.assertTrue((d / "burst.cast.mp4").exists())
@@ -418,7 +413,7 @@ class EncoderRow(unittest.TestCase):
         self.assertIn("Encoder", self.render(Status(100.0, nan, False)))
 
     def test_the_live_panel_asks_the_session(self):
-        w, out = make_wizard(Script("native", TV, "", "done"))
+        w, out = make_wizard(Script(True, TV, "", "done"))
         FakeNative.encoder = Status(41 * 60 + 20, 8.4, False)
         w.offer_cast(FakeStreamOutcome())
         self.assertIn("encoded to 41:20 (8.4x)", out.getvalue())
@@ -427,11 +422,10 @@ class EncoderRow(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             video = Path(tmp) / "m.mp4"
             video.write_bytes(b"x")
-            for answers, backend in ((("native", TV, "", "done"), "native"), (("vlc", TV, "", "done"), "vlc")):
-                w, out = make_wizard(Script(*answers))
-                w.offer_cast(engine.Outcome(video, True, None, [], 1.0, None, 600.0))
-                self.assertNotIn("Encoder", out.getvalue(), backend)
-                self.assertIn("Casting to", out.getvalue())
+            w, out = make_wizard(Script(True, TV, "", "done"))
+            w.offer_cast(engine.Outcome(video, True, None, [], 1.0, None, 600.0))
+            self.assertNotIn("Encoder", out.getvalue())
+            self.assertIn("Casting to", out.getvalue())
 
 
 if __name__ == "__main__":

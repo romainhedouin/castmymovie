@@ -9,10 +9,7 @@ Chrome's tab casting is a *live mirror*: it re-encodes the page in real time at 
 30 fps and stereo
 ([Chromium source](https://chromium.googlesource.com/chromium/src/+/main/components/mirroring/service/mirror_settings.cc)),
 with almost no buffer. One Wi-Fi hiccup and it stutters or drops to a blocky 0.3 Mbit/s. castmymovie
-instead lets the **TV pull the file and buffer it**, which rides out the spikes. There are two ways to do
-that; you pick one at the cast step.
-
-### The TV's own player (the default)
+instead lets the **TV pull the file and buffer it**, which rides out the spikes.
 
 castmymovie runs a tiny web server on the Mac that serves only the prepared `.cast.mp4`, only to the TV,
 under a random address. It then asks the TV to open Google's Default Media Receiver (the player built into
@@ -31,20 +28,6 @@ the keys, and looks after the cast:
   again *where it was* (never from the start), at most 3 times in 10 minutes, then stops and tells you the
   time to start from;
 - if someone else casts to the TV, or you close the player with the TV remote, it lets them and stops.
-
-### VLC
-
-A headless VLC re-muxes the file into a *live* Matroska stream for the TV (VLC 3's Chromecast output always
-streams live). The video is passed through untouched, and so are stereo AAC and Opus, but VLC decodes and
-re-encodes any other audio (5.1 AAC, MP3, FLAC...) live while casting: castmymovie warns you when that will
-happen. The weak spot is a bad link: a TV that falls behind on a live stream drops video and keeps the sound,
-and when the TV reports a stall VLC restarts the stream from where it began and switches to live video
-transcoding.
-
-VLC stays available because it is a different code path: if the TV's own player refuses a file, VLC may still
-get it on screen. castmymovie drives VLC through its remote-control interface, which is where the pause, seek
-and position bar come from in that mode. The prepared file is the same for both (it is made for the TV's own
-player), which is why VLC may have audio to convert.
 
 ### Cast on the fly
 
@@ -65,34 +48,19 @@ See the README for what it does and when it is offered. Under the hood:
 
 ## How the player's numbers are measured
 
-**Natively, the Link and Buffer rows come from the Mac's own web server.** It counts every byte it hands the
-TV, which gives the delivery rate, and it knows exactly how far into the file the TV has downloaded, which
-the movie's bitrate profile turns into seconds: the buffer figure is then good to about a second. The
-operating system's TCP figures (round-trip time, retransmits) are not read in this mode, so those parts of
-the Link row are left out. Cast on the fly, the buffer is exact: the seconds of segments the TV has fetched
-past its position.
+**The Link and Buffer rows come from the Mac's own web server.** It counts every byte it hands the TV, which
+gives the delivery rate, and it knows exactly how far into the file the TV has downloaded, which the movie's
+bitrate profile turns into seconds: the buffer figure is good to about a second (how the file interleaves
+sound and picture). Cast on the fly, the buffer is exact: the seconds of segments the TV has fetched past its
+position. Round-trip time and retransmits are not measured, since the server only sees what it sends.
 
-**With VLC, the buffer figure is an estimate, good to roughly ±10 s and sometimes worse.** A Cast TV never
-says how much it has buffered (its status messages carry only position and state), so castmymovie infers
-it: the bytes sent to the TV are converted to media time using the movie's real bitrate profile, minus where
-the TV is now. That conversion is not exact (VLC re-muxes the stream and converts the audio), so the number
-is smoothed, rounded, and re-anchored whenever the truth is known: at a stall the buffer is empty, and after
-a seek the TV starts filling from scratch. Against a real Xiaomi Google TV it showed a believable sawtooth
-(draining about 1 s per second, jumping each time the TV pulled a chunk) and stayed flat while paused. Over
-a 5 minute run it stayed in a plausible 20-50 s band without runaway drift, but its low points moved by 20 s
-or more between scenes, partly the estimate and partly the TV's own behaviour, which I could not separate.
+The TV's state and position come from the cast's own control connection, so no second connection is opened.
+Cast devices use self-signed certificates, so the connection does not verify the TV's certificate; it only
+talks to your own LAN.
 
 Two things that look odd but are right: the buffer can read 50+ s in a quiet, low-bitrate scene because the
 TV prefetches a fixed amount of *data* (about 6 MB), not a fixed number of seconds; and "delivered" can sit
 well below "needs" for a few seconds because the TV pulls in bursts, which is why it is averaged over 30 s.
-
-With VLC, the TV's state and position come from a small read-only Cast client built in (`castlink.py`): it
-connects as a second sender, the way the Google Home app does, and only ever sends status requests and
-heartbeats. It never launches anything or sends playback commands (a test enforces this). Link statistics
-come from the operating system's TCP counters (`nettop`) and are **macOS only**: elsewhere the Link row is
-simply left out. The native cast needs neither: it reads its own control connection and its own server.
-Cast devices use self-signed certificates, so neither connection verifies the TV's certificate; they only
-talk to your own LAN.
 
 ## Why 6 Mbit/s for 2.4 GHz?
 

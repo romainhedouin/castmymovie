@@ -34,7 +34,7 @@ castmymovie
 │ My Movie 2020 1080p HEVC 5.1.cast.mp4                                 │
 │ ▶ 50:41 ━━━━━━━━━━━━━━╺━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2:34:45          │
 │ Buffer ━━━━━━━━━━━━━━━━━━━━━━╺━ ≈ 55 s  comfortable                   │
-│ Link   1.0 Mbit/s (needs 0.7) · 16 ms · 0.1% retransmits   ● good     │
+│ Link   1.0 Mbit/s (needs 0.7)   ● good                                │
 │ playing   space pause   ←/→ ±10 s   ↑/↓ ±2 min   q stop               │
 ╰───────────────────────────────────────────────────────────────────────╯
 ```
@@ -42,11 +42,9 @@ castmymovie
 ## Install
 
 You need a Mac (Linux should work but is untested), Python 3.9+ and [ffmpeg](https://ffmpeg.org).
-[VLC](https://www.videolan.org/vlc/) is optional.
 
 ```
 brew install ffmpeg
-brew install --cask vlc      # optional
 git clone https://github.com/romainhedouin/castmymovie && cd castmymovie
 ./install.sh
 ```
@@ -69,7 +67,7 @@ Prefer pipx? `pipx install .` works too.
 
 Chrome's tab casting is a live mirror at about 5 Mbit/s with almost no buffer, so one Wi-Fi hiccup stutters.
 castmymovie instead serves the file from your Mac and lets the TV's own player pull and buffer it.
-[How it works](docs/how-it-works.md) has the details, including the VLC alternative.
+[How it works](docs/how-it-works.md) has the details.
 
 ### Cast on the fly (experimental)
 
@@ -81,7 +79,7 @@ while you watch.
 - Offered only when the video must be re-encoded. Everything else takes seconds, so it is not asked.
 - The sound is converted first, then ffmpeg cuts the video into 6 s pieces that the Mac serves to the TV as
   an ordinary stream, with the full length and seek bar from the start.
-- The TV's own player only (no VLC), and no `.cast.mp4` is written. The pieces live in a temporary folder
+- No `.cast.mp4` is written. The pieces live in a temporary folder
   and are deleted when the cast stops.
 - Seeking back to a converted part is instant. A jump far ahead of the encoder restarts it there and can
   pause the picture for a few seconds.
@@ -97,11 +95,9 @@ while you watch.
 | `playing` / `paused` / `buffering…` | The TV's own state. |
 | `Buffer ≈ 55 s` | Seconds the TV has downloaded ahead of what it is showing. |
 | `Encoder encoded to 41:20 (8.4x)  17 min ahead` | Cast on the fly only: how far the conversion has got, how fast, and its lead over the TV. |
-| `Link 1.0 Mbit/s (needs 0.7) · 16 ms · 0.1% retransmits` | Over the last 30 s: data delivered vs what the movie needs, round-trip time, share of data re-sent. The last two are VLC only. |
+| `Link 1.0 Mbit/s (needs 0.7)` | Over the last 30 s: data delivered vs what the movie needs. |
 | `● good / fair / poor / refilling` | One-word verdict. `refilling` means a seek just emptied the buffer, which is normal. |
 | a dim line such as `TV reconnected` | What castmymovie just did to keep the cast going. When the cast ends on its own, it says why. |
-
-With VLC the buffer figure is an estimate (about ±10 s). See [how it works](docs/how-it-works.md).
 
 ## Choosing the quality
 
@@ -144,32 +140,27 @@ download it*. The TV downloads the movie from the Mac, so it must be able to rea
 - The movie is only served to the address the TV was found at. If castmymovie says it *turned away* another
   address, that is probably the TV: choose *Enter an IP address…* and type that one.
 
-If the TV downloaded part of the movie and still refused it, its player cannot decode the file: try *Cast it
-with VLC instead*.
+If the TV downloaded part of the movie and still refused it, its player cannot decode the file (HEVC on an
+older TV, say). A lower Wi-Fi option re-encodes high-bitrate files to plain H.264.
 
 **Stutters or buffers a lot.** Your Wi-Fi to the TV is the weak link, not the file. In order of impact: move
 the TV to 5 GHz; set a fixed 2.4 GHz channel (1, 6 or 11) instead of Auto; put the Mac on 5 GHz or Ethernet
 so the video does not cross the same congested band twice; pick *Weak Wi-Fi*. `ping <tv-ip>` should be under
 10 ms with no loss.
 
-**Nothing plays, or the cast stops by itself.** The terminal and the dim line in the player say why. Each
-cast also writes a log, overwritten by the next one, in `$TMPDIR` (`open $TMPDIR`; `/tmp` if unset):
-
-- `castmymovie-native.log` for the TV's own player: every message to and from the TV, state changes, every
-  reconnect and reload decision, and every download the TV made. It stops growing at 20 MB.
-- `castmymovie-vlc.log` for VLC (verbose).
-
-The logs are readable by you only. They contain the movie's path and the TV's address; the secret part of the
-movie's web address is written as `***`.
+**Nothing plays, or the cast stops by itself.** The terminal and the dim line in the player say why. Each cast
+also writes a log, overwritten by the next one, to `$TMPDIR/castmymovie-native.log` (`open $TMPDIR`; `/tmp` if
+unset): every message to and from the TV, state changes, every reconnect and reload decision, and every download
+the TV made. It stops growing at 20 MB and is readable by you only. It contains the movie's path and the TV's
+address; the secret part of the movie's web address is written as `***`.
 
 ## Limits
 
-- Subtitles: the TV's player shows the `.vtt` file you pick at the cast step. With VLC they are not shown.
+- Subtitles: the TV's player shows the `.vtt` file you pick at the cast step.
 - HDR sources are flagged, not tone-mapped. Image-based subtitles (PGS/VobSub) can't be converted.
 - One video stream and one audio track are kept (you are asked when there are several).
 - HEVC is only kept on macOS; elsewhere it is re-encoded to H.264.
 - The TV must be able to reach the Mac over the network.
-- Link statistics with VLC are macOS only.
 - Tested against a Xiaomi Google TV; other Cast receivers should work but are untested.
 
 ## Development
@@ -178,9 +169,9 @@ movie's web address is written as `***`.
 python3 -m venv .venv && .venv/bin/pip install -e . && .venv/bin/python -m unittest discover -s tests
 ```
 
-About 450 tests, around 3 minutes, all on this machine (nothing goes beyond 127.0.0.1). They build tiny
+About 400 tests, around 6 minutes, all on this machine (nothing goes beyond 127.0.0.1). They build tiny
 synthetic clips with ffmpeg and exercise the converter, the movie server, the Cast sender against a fake TV
-(`tests/fakereceiver.py`), the VLC controller against a fake VLC, and the whole wizard with scripted prompts.
+(`tests/fakereceiver.py`), and the whole wizard with scripted prompts.
 
 ## License
 

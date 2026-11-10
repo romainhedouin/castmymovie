@@ -9,7 +9,7 @@ description = "Get any movie onto your Google TV: pick it, make it cast-ready, c
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-keywords = ["ffmpeg", "chromecast", "google-tv", "vlc", "remux", "video"]
+keywords = ["ffmpeg", "chromecast", "google-tv", "remux", "video"]
 dependencies = ["rich>=13", "questionary>=2", "zeroconf>=0.130"]
 
 [project.scripts]

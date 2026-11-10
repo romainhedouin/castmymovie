@@ -4,12 +4,11 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from castmymovie import cast  # noqa: E402
 from test_nativecast import Base  # noqa: E402
-from test_ui import TV, FakeCaster, FakeNative, Script, make_wizard  # noqa: E402
+from test_ui import TV, FakeNative, Script, make_wizard  # noqa: E402
 
 KEY_HELP = ("space pause", "q stop", "Ctrl-C")
 
@@ -122,7 +121,7 @@ class Panel(unittest.TestCase):
         self.assertIn("buffering…", render(buffering=True))
 
     def test_an_ended_panel_keeps_the_time_it_stopped_at_whatever_the_backend_says_about_buffering(self):
-        for buffering in (True, False):           # NativeCast counts an idle TV as buffering, VLC does not
+        for buffering in (True, False):           # NativeCast counts an idle TV as buffering, another player might not
             w, out = make_wizard(Script())
             st = cast.PlayState(1234.0, 6000.0, False, buffering, False)
             w.console.print(w.render_cast(st, TV, Path("/m/Night.mp4"), True, notice="The movie finished."))
@@ -135,56 +134,34 @@ class Panel(unittest.TestCase):
 
 
 class WhatNext(unittest.TestCase):
-    """After a native cast that started, then ended by itself. The menu is the one a start failure gets."""
+    """After a cast that started, then ended by itself. The menu is the one a start failure gets."""
 
-    def run_wizard(self, session_cls, *answers, vlc="/fake/VLC"):
+    def run_wizard(self, session_cls, *answers):
         outcome = SimpleNamespace(video=Path("/m/Night.cast.mp4"), subtitles=[], duration=600.0, curve=None)
         script = Script(*answers)
-        w, out = make_wizard(script, vlc=vlc)
-        w.native_caster = lambda *a, **k: session_cls(*a, **k)
+        w, out = make_wizard(script)
+        w.caster = lambda *a, **k: session_cls(*a, **k)
         w.offer_cast(outcome)
         return w, script, out.getvalue()
 
-    def test_a_cast_that_gave_up_offers_vlc_like_a_failed_start(self):
+    def test_a_cast_that_gave_up_offers_to_cast_again(self):
         gave_up = ended(True, "The TV kept failing, so I gave up after 3 reloads in 10 minutes.")
-        _, script, text = self.run_wizard(gave_up, "native", TV, "", "switch", "", "done")
-        self.assertEqual(script.offered["What next?"][0],
-                         ["Cast it again", "Try with VLC", "Choose another TV", "Done with this movie"])
-        self.assertEqual(script.defaults["What next?"][0], "switch")
+        _, script, text = self.run_wizard(gave_up, True, TV, "", "done")
+        self.assertEqual(script.offered["What next?"][0], ["Cast it again", "Choose another TV", "Done with this movie"])
+        self.assertEqual(script.defaults["What next?"][0], "again")
         self.assertIn("gave up after 3 reloads", text)
         self.assertNotIn("buffering", text)
 
     def test_a_finished_movie_is_not_treated_as_an_error(self):
-        _, script, text = self.run_wizard(ended(False, "The movie finished."), "native", TV, "", "done")
-        self.assertEqual(script.offered["What next?"][0],
-                         ["Cast it again", "Cast it with VLC instead", "Choose another TV", "Done with this movie"])
+        _, script, text = self.run_wizard(ended(False, "The movie finished."), True, TV, "", "done")
+        self.assertEqual(script.offered["What next?"][0], ["Cast it again", "Choose another TV", "Done with this movie"])
         self.assertEqual(script.defaults["What next?"][0], "again")
         self.assertIn("The movie finished.", text)
         self.assertNotIn("buffering", text)
 
-    def test_another_device_taking_over_is_not_a_failure_of_the_native_cast(self):
+    def test_another_device_taking_over_is_not_a_failure(self):
         took_over = ended(False, "Another device started casting to the TV. The movie stopped at 03:10.")
-        _, script, _ = self.run_wizard(took_over, "native", TV, "", "done")
-        self.assertEqual(script.defaults["What next?"], ["again"])
-
-    def test_the_switch_goes_to_vlc_with_the_same_start_question(self):
-        gave_up = ended(True, "The TV kept failing, so I gave up after 3 reloads in 10 minutes.")
-        w, script, _ = self.run_wizard(gave_up, "native", TV, "", "switch", "", "done")
-        self.assertEqual(len(FakeCaster.instances), 1)
-        self.assertEqual(FakeCaster.instances[0].args[:2], ("/fake/VLC", TV))
-
-    def test_without_vlc_a_failed_cast_has_nothing_to_fall_back_to(self):
-        gave_up = ended(True, "The TV kept failing, so I gave up after 3 reloads in 10 minutes.")
-        _, script, _ = self.run_wizard(gave_up, "native", TV, "", "done", vlc=None)
-        self.assertEqual(script.offered["What next?"][0], ["Cast it again", "Choose another TV", "Done with this movie"])
-        self.assertEqual(script.defaults["What next?"], ["again"])
-
-    def test_a_vlc_cast_that_ends_is_not_a_native_failure(self):
-        outcome = SimpleNamespace(video=Path("/m/Night.cast.mp4"), subtitles=[], duration=600.0, curve=None)
-        script = Script("vlc", TV, "", "done")
-        w, _ = make_wizard(script)
-        with mock.patch.object(FakeCaster, "state", lambda self: cast.PlayState(0.0, 600.0, False, False, False)):
-            w.offer_cast(outcome)
+        _, script, _ = self.run_wizard(took_over, True, TV, "", "done")
         self.assertEqual(script.defaults["What next?"], ["again"])
 
 
@@ -194,20 +171,20 @@ class Defaults(unittest.TestCase):
     def test_the_first_choices_have_the_defaults_the_wizard_promises(self):
         gave_up = ended(True, "The TV kept failing, so I gave up after 3 reloads in 10 minutes.")
         outcome = SimpleNamespace(video=Path("/m/Night.cast.mp4"), subtitles=[], duration=600.0, curve=None)
-        script = Script("native", TV, "", "done")
+        script = Script(True, TV, "", "done")
         w, _ = make_wizard(script, receivers=[TV])
-        w.native_caster = lambda *a, **k: gave_up(*a, **k)
+        w.caster = lambda *a, **k: gave_up(*a, **k)
         w.offer_cast(outcome)
-        self.assertEqual(script.defaults["Play it on your TV now?"], ["native"])
         self.assertEqual(script.defaults["Which TV?"], [TV])
+        self.assertEqual(script.defaults["What next?"], ["again"])
 
-    def test_a_failed_start_defaults_to_vlc_and_a_good_one_to_again(self):
+    def test_a_failed_start_defaults_to_again_every_time(self):
         outcome = SimpleNamespace(video=Path("/m/Night.cast.mp4"), subtitles=[], duration=600.0, curve=None)
-        script = Script("native", TV, "", "switch", "", "done")
+        script = Script(True, TV, "", "again", "", "done")
         w, _ = make_wizard(script)
         FakeNative.fail = True
         w.offer_cast(outcome)
-        self.assertEqual(script.defaults["What next?"][0], "switch")
+        self.assertEqual(script.defaults["What next?"][0], "again")
         self.assertEqual(script.defaults["What next?"][1], "again")
 
 

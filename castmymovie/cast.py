@@ -1,12 +1,7 @@
-"""Find Cast receivers on the network, the interface every cast backend offers, and the VLC backend.
+"""Find Cast receivers on the network, and the interface a cast session offers the player.
 
-There are two ways to play a file on the TV, both behind the same `CastSession` interface:
-
-- `nativecast.NativeCast` (the default): this Mac serves the file over HTTP and tells the TV's own media
-  player to play it as an ordinary, buffered movie.
-- `VlcCast` (here): a headless VLC re-muxes the file into a *live* stream for the TV. We drive VLC through
-  its remote-control (rc) interface on a local socket, so the wizard can show a live position bar and offer
-  pause / seek / stop.
+`nativecast.NativeCast` is the session: this Mac serves the file over HTTP and tells the TV's own media player
+to play it as an ordinary, buffered movie.
 """
 
 from __future__ import annotations
@@ -15,11 +10,9 @@ import ipaddress
 import os
 import re
 import shutil
-import socket
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,7 +21,6 @@ from typing import Protocol
 from .engine import CastError
 
 CAST_TYPE = "_googlecast._tcp.local."
-VLC_MAC = "/Applications/VLC.app/Contents/MacOS/VLC"
 
 
 # ---------------------------------------------------------------- receivers
@@ -132,13 +124,7 @@ def discover(timeout: float = 4.0) -> list:
     return sorted(found.values(), key=lambda r: r.name.lower())
 
 
-# ---------------------------------------------------------------- VLC
-
-def find_vlc() -> str | None:
-    if os.path.exists(VLC_MAC):
-        return VLC_MAC
-    return shutil.which("vlc")
-
+# ---------------------------------------------------------------- helpers
 
 def keep_awake(pid: int) -> subprocess.Popen | None:
     """Stop the Mac from idle-sleeping while process `pid` runs. Nothing a cast does counts as user activity, so
@@ -177,12 +163,6 @@ def open_private_log(path: Path):
         return None
 
 
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 @dataclass
 class PlayState:
     position: float
@@ -193,18 +173,17 @@ class PlayState:
 
 
 class CastSession(Protocol):
-    """What the player needs from a cast backend (`VlcCast`, `nativecast.NativeCast`).
+    """What the player needs from a cast backend (`nativecast.NativeCast`).
 
     start() blocks until the TV is actually playing and raises engine.CastError with a message for the user
     otherwise. stop() must be safe to call at any time, more than once, and after a failed start(). The
     player calls state() a couple of times a second, so it must be cheap.
 
     Optional members the player and the telemetry use when a backend has them:
-      proc           the process doing the streaming (VLC), whose TCP counters `nettop` can read
       notice         one short human sentence about what just happened ("TV reconnected"), shown in the panel
       failed         True once the cast ended on its own because it gave up (not because the movie finished)
-      link_sample()  a linkstats.LinkSample from the backend's own byte counters (no nettop needed)
-      tv_status()    a castlink.TvStatus from the backend's own Cast connection (no second connection needed)
+      link_sample()  a linkstats.LinkSample from the backend's own byte counters
+      tv_status()    a castlink.TvStatus from the backend's own Cast connection
     """
 
     def start(self, timeout: float = 40.0) -> None: ...
@@ -236,178 +215,3 @@ def parse_time(text: str) -> float | None:
     for p in parts:
         secs = secs * 60 + int(p)
     return float(secs)
-
-
-def build_vlc_cmd(vlc: str, receiver: Receiver, media: Path, rc_port: int, http_port: int, start: float = 0.0) -> list:
-    cmd = [vlc, "-vv", "-I", "dummy", "--extraintf", "rc", f"--rc-host=127.0.0.1:{rc_port}",
-           "--sout", "#chromecast", f"--sout-chromecast-ip={receiver.host}",
-           f"--sout-chromecast-http-port={http_port}", "--demux-filter=demux_chromecast",
-           "--no-sub-autodetect-file"]
-    if start > 0:
-        cmd.append(f"--start-time={int(start)}")
-    return cmd + [str(media)]
-
-
-class VlcCast:
-    """One cast session through VLC (a `CastSession`). VLC runs headless; we talk to it over the rc socket."""
-
-    STALL_SECONDS = 2.5
-
-    def __init__(self, vlc: str, receiver: Receiver, media: Path, start: float = 0.0):
-        self.vlc, self.receiver, self.media, self.start_at = vlc, receiver, Path(media), start
-        self.proc: subprocess.Popen | None = None
-        self.awake: subprocess.Popen | None = None
-        self.sock: socket.socket | None = None
-        self._owed = False  # the last rc command has not been fully answered yet
-        self.paused = False
-        self.length = 0.0
-        self._last_pos = -1.0
-        self._last_move = time.monotonic()
-        self.log_path = Path(tempfile.gettempdir()) / "castmymovie-vlc.log"
-        self._logging = False
-
-    def _see_log(self) -> str:
-        return f" (see {self.log_path})" if self._logging else ""
-
-    # --- lifecycle
-    def start(self, timeout: float = 40.0) -> None:
-        rc, http = free_port(), free_port()
-        log = open_private_log(self.log_path)
-        self._logging = log is not None  # without a log, no message should send the user to a stale one
-        self.proc = subprocess.Popen(build_vlc_cmd(self.vlc, self.receiver, self.media, rc, http, self.start_at),
-                                     stdout=log or subprocess.DEVNULL, stderr=subprocess.STDOUT,
-                                     stdin=subprocess.DEVNULL)
-        if log is not None:
-            log.close()
-        self.awake = keep_awake(self.proc.pid)  # the Mac must not doze off mid-movie
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.proc.poll() is not None:
-                raise CastError(f"VLC exited unexpectedly{self._see_log()}")
-            try:
-                self.sock = socket.create_connection(("127.0.0.1", rc), timeout=1)
-                break
-            except OSError:
-                time.sleep(0.2)
-        else:
-            self.stop()
-            raise CastError("could not reach VLC's control interface")
-        self.sock.settimeout(0.4)
-        self._read_prompt()  # swallow the banner
-        while time.monotonic() < deadline:  # wait until the TV is actually playing
-            if self.proc.poll() is not None:
-                raise CastError(f"VLC stopped while starting the cast{self._see_log()}")
-            t, ln, playing = self._number("get_time"), self._number("get_length"), self._number("is_playing")
-            if ln:
-                self.length = float(ln)
-            if playing and t:
-                return
-            time.sleep(0.5)
-        self.stop()
-        raise CastError(f"{self.receiver.name} did not start playing within {int(timeout)} s")
-
-    def stop(self) -> None:
-        if self.sock:
-            try:
-                self.sock.sendall(b"quit\n")
-            except OSError:
-                pass
-            if self.proc:
-                try:
-                    self.proc.wait(timeout=1.0)  # let VLC close the cast session cleanly if it will
-                except subprocess.TimeoutExpired:
-                    pass
-            self.sock.close()
-            self.sock = None
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()  # VLC's chromecast teardown does not always exit on quit
-            try:
-                self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait()
-        let_sleep(self.awake)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.stop()
-
-    # --- rc protocol
-    def _read_prompt(self, timeout: float = 1.5) -> str:
-        buf, deadline = b"", time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                d = self.sock.recv(4096)
-            except socket.timeout:
-                if buf:
-                    break
-                continue
-            except OSError:
-                break
-            if not d:
-                break
-            buf += d
-            if buf.rstrip(b" \r\n").endswith(b">"):
-                break
-        return buf.decode(errors="replace")
-
-    def _settle(self) -> None:
-        """Get the rc socket back in step before a command. VLC has no request ids: a reply that comes in late would
-        be read as the answer to the next command (a time taken for a length, a length for a state)."""
-        if self._owed:  # the last command got no complete reply yet: let it arrive, then throw it away
-            self._read_prompt()
-            self._owed = False
-        self.sock.settimeout(0)
-        try:
-            while self.sock.recv(4096):
-                pass
-        except OSError:  # nothing left to read (or the socket is gone: the send below reports that)
-            pass
-        self.sock.settimeout(0.4)
-
-    def _cmd(self, text: str) -> str:
-        if not self.sock:
-            return ""
-        try:
-            self._settle()
-            self.sock.sendall(text.encode() + b"\n")
-        except OSError:
-            return ""
-        reply = self._read_prompt()
-        self._owed = not reply.rstrip(" \r\n").endswith(">")
-        return reply
-
-    def _number(self, text: str) -> int | None:
-        nums = re.findall(r"^\s*(-?\d+)\s*$", self._cmd(text).replace("\r", ""), re.M)
-        return int(nums[-1]) if nums else None
-
-    # --- controls
-    def state(self) -> PlayState:
-        alive = self.proc is not None and self.proc.poll() is None
-        pos = self._number("get_time") if alive else None
-        if self.length <= 0 and alive:
-            self.length = float(self._number("get_length") or 0)
-        position = float(pos) if pos is not None else max(self._last_pos, 0.0)
-        now = time.monotonic()
-        if position != self._last_pos:
-            self._last_pos, self._last_move = position, now
-        stuck = now - self._last_move > self.STALL_SECONDS
-        if alive and pos is None and self._last_pos >= 0 and stuck and self._number("is_playing") == 0:
-            alive = False  # VLC is up but has no input left: the movie ended or the TV stopped it
-        buffering = alive and not self.paused and stuck
-        return PlayState(position, self.length, self.paused, buffering, alive)
-
-    def toggle_pause(self) -> None:
-        self._cmd("pause")
-        self.paused = not self.paused
-        self._last_move = time.monotonic()
-
-    def seek_to(self, seconds: float) -> None:
-        top = max(self.length - 5, 0) if self.length else seconds
-        self._cmd(f"seek {int(min(max(seconds, 0), top))}")
-        self._last_move = time.monotonic()
-
-    def seek_by(self, delta: float) -> None:
-        self.seek_to(max(self._last_pos, 0) + delta)

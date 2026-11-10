@@ -135,43 +135,6 @@ class SessionLogCap(unittest.TestCase):
         log.write("two")                                                # the log gave up, quietly
 
 
-class VlcLogIsSafe(unittest.TestCase):
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.tmp, True)
-        for target, value in (("tempfile.gettempdir", str(self.tmp)), ("free_port", 1234), ("keep_awake", None)):
-            patcher = mock.patch(f"castmymovie.cast.{target}", return_value=value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-
-    def run_start(self, vlc_cast):
-        """start() against a VLC that dies at once; returns the Popen call and the error."""
-        proc = mock.Mock()
-        proc.poll.return_value = 1
-        with mock.patch.object(cast.subprocess, "Popen", return_value=proc) as popen:
-            with self.assertRaises(engine.CastError) as cm:
-                vlc_cast.start(timeout=2)
-        return popen, str(cm.exception)
-
-    def vlc_cast(self):
-        return cast.VlcCast("/nonexistent/vlc", cast.Receiver("Fake TV", "127.0.0.1"), self.tmp / "m.mp4")
-
-    def test_a_planted_symlink_is_not_followed(self):
-        victim = self.tmp / "victim.txt"
-        victim.write_text("precious")
-        (self.tmp / "castmymovie-vlc.log").symlink_to(victim)
-        popen, message = self.run_start(self.vlc_cast())
-        self.assertEqual(victim.read_text(), "precious")
-        self.assertEqual(popen.call_args.kwargs["stdout"], cast.subprocess.DEVNULL)   # VLC still starts, without a log
-        self.assertNotIn("(see", message)
-
-    def test_the_log_is_readable_by_its_owner_only(self):
-        c = self.vlc_cast()
-        popen, message = self.run_start(c)
-        self.assertEqual(stat.S_IMODE(c.log_path.stat().st_mode), 0o600)
-        self.assertIn(f"(see {c.log_path})", message)
-
-
 class OpenPrivateLog(unittest.TestCase):
     def test_a_file_owned_by_someone_else_is_refused(self):
         tmp = Path(tempfile.mkdtemp())

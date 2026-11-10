@@ -1,12 +1,6 @@
-"""The Cast (CASTV2) wire protocol, by hand: one connection class, and a read-only status client.
+"""The Cast (CASTV2) wire protocol, by hand: the connection class `nativecast.NativeCast` drives the TV with.
 
-`CastConnection` is the plumbing every Cast client needs: a TLS socket to port 8009, the framing, request ids.
-Two clients use it:
-
-  - `StatusReader` (here) only *listens*: it connects as a second "sender" (the way the Google Home app does),
-    sends GET_STATUS, and reads the TV's own playback position and player state. It never launches an app,
-    loads media or sends playback commands, so it can sit next to VLC without disturbing its cast.
-  - `nativecast.NativeCast` is a full sender: it launches the TV's media player and drives it.
+`CastConnection` is the plumbing a Cast client needs: a TLS socket to port 8009, the framing, request ids.
 
 The wire format is a 4-byte big-endian length followed by a protobuf `CastMessage`; the one message
 shape we need is small enough to encode and decode by hand, so there is no protobuf dependency.
@@ -27,7 +21,6 @@ RECV_NS = "urn:x-cast:com.google.cast.receiver"
 MEDIA_NS = "urn:x-cast:com.google.cast.media"
 HEART_NS = "urn:x-cast:com.google.cast.tp.heartbeat"
 SENDER = "sender-castmymovie"
-HEARTBEAT_EVERY = 4.0
 MAX_FRAME = 65536    # the Cast protocol's limit for one message: a longer length prefix is not a Cast receiver
 MAX_VARINT = 10      # bytes: a protobuf varint holds at most 64 bits
 
@@ -212,81 +205,3 @@ class TvStatus:
     position: float | None   # seconds, as the TV reports it
     state: str | None        # IDLE | PLAYING | PAUSED | BUFFERING
     duration: float | None
-
-
-class StatusReader:
-    """Connect once, then poll() as often as you like. Every method is safe to call when offline."""
-
-    def __init__(self, host: str, port: int = 8009, tls: bool = True):
-        self.host, self.port, self.tls = host, port, tls
-        self.conn = CastConnection(host, port, tls)
-        self.transport: str | None = None
-        self.last: TvStatus | None = None
-        self._last_ping = 0.0
-
-    @property
-    def sock(self):
-        return self.conn.sock
-
-    @property
-    def connected(self) -> bool:
-        return self.conn.connected and self.transport is not None
-
-    # --- plumbing
-    def _send(self, dest: str, namespace: str, payload: dict) -> None:
-        self.conn.send(dest, namespace, payload)  # raises OSError once read() saw the TV hang up
-
-    def _drain(self, seconds: float) -> list:
-        """Read whatever arrives in `seconds`; returns [(namespace, parsed JSON)]. Closes on EOF."""
-        return [(m.namespace, m.data) for m in self.conn.read(seconds)]
-
-    # --- public
-    def open(self, timeout: float = 4.0) -> bool:
-        """Connect and attach to the app currently running on the TV. False if there is none (yet)."""
-        self.close()
-        try:
-            self.conn.open(timeout)
-            self._send("receiver-0", CONN_NS, {"type": "CONNECT"})
-            self._send("receiver-0", RECV_NS, {"type": "GET_STATUS"})
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline and self.conn.connected and not self.transport:
-                for _, msg in self._drain(0.3):
-                    apps = (msg.get("status") or {}).get("applications") or []
-                    if msg.get("type") == "RECEIVER_STATUS" and apps:
-                        self.transport = apps[0].get("transportId")
-            if self.transport:
-                self._send(self.transport, CONN_NS, {"type": "CONNECT"})
-                return True
-        except (OSError, ssl.SSLError):
-            pass
-        self.close()
-        return False
-
-    def poll(self) -> TvStatus | None:
-        """Ask for the current status and return it (the last known one if the TV did not answer in time)."""
-        if not self.connected:
-            return self.last
-        try:
-            now = time.monotonic()
-            if now - self._last_ping > HEARTBEAT_EVERY:
-                self._send("receiver-0", HEART_NS, {"type": "PING"})
-                self._last_ping = now
-            self._send(self.transport, MEDIA_NS, {"type": "GET_STATUS"})
-            for namespace, msg in self._drain(0.25):
-                kind = msg.get("type")
-                if namespace == HEART_NS and kind == "PING":
-                    self._send("receiver-0", HEART_NS, {"type": "PONG"})
-                elif kind == "CLOSE":
-                    self.close()
-                    break
-                elif kind == "MEDIA_STATUS" and msg.get("status"):
-                    st = msg["status"][0]
-                    media = st.get("media") or {}
-                    self.last = TvStatus(num(st.get("currentTime")), st.get("playerState"), num(media.get("duration")))
-        except (OSError, ssl.SSLError):
-            self.close()
-        return self.last
-
-    def close(self) -> None:
-        self.conn.close()
-        self.transport = None

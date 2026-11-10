@@ -1,4 +1,4 @@
-"""The wizard: pick a movie, choose a quality, watch it get ready, cast it to a TV (natively, or through VLC)."""
+"""The wizard: pick a movie, choose a quality, watch it get ready, cast it to a TV."""
 
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
-from . import __version__, cast, engine, finder, linkstats, nativecast
-from .telemetry import NATIVE_K, SessionReader, Snapshot, Telemetry
+from . import __version__, cast, engine, finder, nativecast
+from .telemetry import SessionReader, Snapshot, Telemetry
 
 THEME = Theme({"accent": "bold cyan", "ok": "green", "bad": "bold red", "warn": "yellow", "dim": "dim"})
 QSTYLE = questionary.Style([
@@ -148,27 +148,23 @@ class Keys:
 
 
 def default_telemetry(session, receiver: cast.Receiver, curve):
-    """Live TV/link/buffer readings. A native session reports on itself (no second Cast connection, no nettop); a
-    VLC session is watched from outside through its process. None for anything else."""
+    """Live TV/link/buffer readings. The session reports on itself, so no second Cast connection is opened. None for
+    a session that cannot (a test double)."""
     if callable(getattr(session, "tv_status", None)) and callable(getattr(session, "link_sample", None)):
-        return Telemetry(None, receiver.host, curve, reader=SessionReader(session),
-                         read_link=lambda pid, host: session.link_sample(), k=NATIVE_K)
-    proc = getattr(session, "proc", None)
-    return Telemetry(proc.pid, receiver.host, curve) if proc is not None else None
+        return Telemetry(SessionReader(session), session.link_sample, curve)
+    return None
 
 
 # ---------------------------------------------------------------- the wizard
 
 class Wizard:
     def __init__(self, console: Console | None = None, prompt: Prompter | None = None, keys=None,
-                 find_videos=finder.find_videos, discover=cast.discover, find_vlc=cast.find_vlc,
-                 caster=cast.VlcCast, telemetry=default_telemetry, native_caster=nativecast.NativeCast,
-                 stream_prepare=None):
+                 find_videos=finder.find_videos, discover=cast.discover, telemetry=default_telemetry,
+                 caster=nativecast.NativeCast, stream_prepare=None):
         self.console = console or Console(theme=THEME)
         self.prompt = prompt or Prompter()
         self.keys = keys if keys is not None else (Keys if sys.stdin.isatty() else None)
-        self.find_videos, self.discover, self.find_vlc, self.caster = find_videos, discover, find_vlc, caster
-        self.native_caster = native_caster  # the default way to cast; `caster` is the VLC one
+        self.find_videos, self.discover, self.caster = find_videos, discover, caster
         self.telemetry = telemetry
         self._stream_prepare = stream_prepare  # None: onthefly.prepare, looked up when first needed
 
@@ -396,48 +392,29 @@ class Wizard:
 
     def cast_loop(self, outcome) -> None:
         stream_outcome = outcome
-        vlc = self.find_vlc()
-        streaming = getattr(outcome, "on_the_fly", False)  # on the fly: native only, VLC cannot play a live playlist
-        choices = [("Cast it to your TV (recommended)", "native")]
-        if vlc and not streaming:
-            choices.append(("Cast it with VLC instead", "vlc"))
-        choices.append(("Not now", None))
-        backend = self.prompt.select("Play it on your TV now?", choices, default="native")
-        if backend is None:
+        streaming = getattr(outcome, "on_the_fly", False)
+        if not self.prompt.confirm("Play it on your TV now?", default=True):
             return
-        receiver, subtitles, warned = None, None, False
+        receiver, subtitles = None, None
         while True:
             receiver = receiver or self.pick_receiver()
             if receiver is None:
                 return
-            if backend == "vlc" and not warned:
-                self.warn_vlc_audio(outcome.video)
-                warned = True
-            if backend == "native" and subtitles is None:
+            if subtitles is None:
                 subtitles = self.pick_subtitles(outcome.subtitles)
             start = self.ask_start(outcome.duration)
-            if backend == "native":
-                extra = {"stream": outcome.make_stream()} if streaming else {}  # a new encoder for every attempt
-                session = self.native_caster(receiver, outcome.video, start, subtitles=subtitles,
-                                             duration=outcome.duration, **extra)
-            else:
-                session = self.caster(vlc, receiver, outcome.video, start)
-            ok = self.cast_to(session, receiver, outcome.video, outcome.curve, native=backend == "native")
-            fallback = bool(vlc) and backend == "native" and not ok and not streaming  # the native cast failed: try VLC
+            extra = {"stream": outcome.make_stream()} if streaming else {}  # a new encoder for every attempt
+            session = self.caster(receiver, outcome.video, start, subtitles=subtitles, duration=outcome.duration, **extra)
+            ok = self.cast_to(session, receiver, outcome.video, outcome.curve)
             options = [("Cast it again", "again")]
             if streaming:
                 options.append(("Convert it fully, then cast (slower, reliable)", "full"))
-            elif vlc:
-                options.append((self.switch_label(backend, fallback), "switch"))
             options += [("Choose another TV", "tv"), ("Done with this movie", "done")]
-            action = self.prompt.select("What next?", options,
-                                        default="switch" if fallback else "full" if streaming and not ok else "again")
+            action = self.prompt.select("What next?", options, default="full" if streaming and not ok else "again")
             if action == "done":
                 return
             if action == "tv":
                 receiver = None
-            if action == "switch":
-                backend = "vlc" if backend == "native" else "native"
             if action == "full":
                 converted = self.convert_stream_fully(stream_outcome)
                 if converted is not None:  # from here on it is an ordinary converted file
@@ -455,20 +432,6 @@ class Wizard:
         if outcome is not None:
             self.show_outcome(outcome, stream_outcome.analysis)
         return outcome
-
-    @staticmethod
-    def switch_label(backend: str, fallback: bool) -> str:
-        if fallback:
-            return "Try with VLC"
-        return "Cast it with VLC instead" if backend == "native" else "Cast it without VLC (recommended)"
-
-    def warn_vlc_audio(self, video: Path) -> None:
-        """The movie was prepared for a TV that plays it itself. VLC passes less audio through: say so, once."""
-        issue = engine.vlc_audio_issue(video)
-        if issue:
-            self.console.print(f"[warn]Heads-up:[/] VLC cannot pass {escape(issue)} through, so it will convert it "
-                               "live while casting, which is the fragile part of a stream. Casting without VLC "
-                               "plays it as it is.")
 
     def pick_subtitles(self, subtitles: list) -> list:
         """Which subtitles the TV should show, if the movie has any. Returns the chosen .vtt files (one or none)."""
@@ -516,17 +479,16 @@ class Wizard:
             secs = cast.parse_time(raw)
             if secs is None:
                 self.console.print("[warn]Use minutes:seconds or hours:minutes:seconds, for example 1:12:30[/]")
-            elif duration and secs >= duration:  # VLC would sit idle until its start timeout, then blame the TV
+            elif duration and secs >= duration:
                 self.console.print(f"[warn]That is past the end of the movie ({engine.fmt_dur(duration)}).[/]")
             else:
                 return secs
 
-    def cast_to(self, session, receiver: cast.Receiver, video: Path, curve=None, native: bool = False) -> bool:
+    def cast_to(self, session, receiver: cast.Receiver, video: Path, curve=None) -> bool:
         """Start `session` (a cast.CastSession), run the player until it ends, always stop it. False if it never started
-        or gave up on its own (`session.failed`): the wizard then suggests VLC. A movie that finished is not a failure."""
-        if native:
-            self.console.print("[dim]If macOS asks whether Python may accept incoming network connections, choose "
-                               "Allow: the TV downloads the movie from this Mac.[/]")
+        or gave up on its own (`session.failed`). A movie that finished is not a failure."""
+        self.console.print("[dim]If macOS asks whether Python may accept incoming network connections, choose "
+                           "Allow: the TV downloads the movie from this Mac.[/]")
         try:
             with self.console.status(f"[dim]Starting on {escape(receiver.name)}…", spinner="dots"):
                 session.start()
@@ -534,7 +496,7 @@ class Wizard:
             session.stop()
             self.error(f"{escape(str(e))}\n\n[dim]Make sure the TV is awake and on the same Wi-Fi as this Mac.[/]")
             return False
-        except BaseException:  # Ctrl-C or a kill (SystemExit): the half-started player or VLC must not outlive us
+        except BaseException:  # Ctrl-C or a kill (SystemExit): the half-started cast must not outlive us
             session.stop()
             raise
         tele = None
@@ -630,7 +592,7 @@ class Wizard:
 
     @staticmethod
     def encoder_status(session):
-        """The on-the-fly encoder's progress, or None (a plain file cast, VLC, or a session without it)."""
+        """The on-the-fly encoder's progress, or None (a plain file cast, or a session without it)."""
         read = getattr(session, "encoder_status", None)
         return read() if callable(read) else None
 
@@ -638,8 +600,7 @@ class Wizard:
         interactive = self.keys is not None
         keys_cm = self.keys() if interactive else None
         steps = {"left": -10, "right": 10, "down": -120, "up": 120}
-        # a backend that counts its own bytes can always show the Link row; VLC's needs nettop
-        measurable = linkstats.available() or callable(getattr(session, "link_sample", None))
+        measurable = callable(getattr(session, "link_sample", None))
         with Live(console=self.console, refresh_per_second=4, transient=False) as live:
             if keys_cm:
                 keys_cm.__enter__()

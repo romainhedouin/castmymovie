@@ -30,5 +30,4 @@ else
 fi
 
 command -v ffmpeg  >/dev/null || echo "Missing ffmpeg: brew install ffmpeg"
-[ -e /Applications/VLC.app ] || command -v vlc >/dev/null || echo "Missing VLC (needed for casting): brew install --cask vlc"
 echo "Run:  castmymovie"
