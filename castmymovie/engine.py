@@ -583,7 +583,7 @@ def audio_out_kbps(channels: int) -> int:
 
 def build_audio_cmd(src: Path, dst: Path, plan: Plan, info: dict) -> list:
     """The audio track alone, as AAC, in a Matroska file. `-copyts` keeps its timestamps where the movie has them, so
-    the video pass can read it as a second input without the two drifting apart."""
+    a track that starts after the video still does (see `audio_start_offset`)."""
     a = next(s for s in info["streams"] if s["index"] == plan.audio_idx)
     channels = min(int(a.get("channels", 2) or 2), 6)
     return ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-progress", "pipe:1", "-nostats", "-y",
@@ -592,15 +592,26 @@ def build_audio_cmd(src: Path, dst: Path, plan: Plan, info: dict) -> list:
             "-f", "matroska", str(dst)]
 
 
+def audio_start_offset(audio: Path, info: dict) -> float:
+    """How many seconds after the source (`info`) the audio pass's output starts: the track's own delay, often about
+    a second in MKV/TS rips. Rounded to Matroska's millisecond, so a track with no delay gives exactly 0."""
+    def start(i: dict) -> float:
+        return float(i["format"].get("start_time") or 0)
+    return round(start(probe(audio)) - start(info), 3)
+
+
 def build_hls_cmd(src: Path, audio_src: Path | None, outdir: Path, plan: Plan, info: dict, max_mbps: float,
-                  fps: Fraction, seg_frames: int, start_index: int = 0) -> list:
+                  fps: Fraction, seg_frames: int, start_index: int = 0, audio_offset: float = 0.0) -> list:
     """Encode the video into `seg%05d.ts` segments of exactly `seg_frames` frames, numbered from `start_index`.
 
     The GOP is a fixed frame count, not a duration: that makes every segment last exactly seg_frames/fps, so the
     playlist the TV gets can state the lengths before they exist. Segment i then starts at i * seg_frames / fps on the
     movie's clock. A run that starts mid-movie seeks both inputs there and shifts its timestamps by the same amount
     (plus the reorder delay the first run has naturally), so segments from different runs join without a gap.
-    `audio_src` is the audio pass's output; without it the chosen track is copied from `src` (TS-compatible codecs only)."""
+    `audio_src` is the audio pass's output; without it the chosen track is copied from `src` (TS-compatible codecs only).
+    `audio_offset` is how much later than `src` that file starts (`audio_start_offset`). ffmpeg shifts every input back
+    to its own start and `-ss` counts from there, so the audio is seeked `audio_offset` less than the video (a negative
+    `-ss`, before the file's start, on a first run or inside the delay): both inputs then line up on the source's clock."""
     v = next(s for s in info["streams"] if s["index"] == plan.video_idx)
     at = start_index * seg_frames / fps
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-progress", "pipe:1", "-nostats", "-y"]
@@ -608,8 +619,8 @@ def build_hls_cmd(src: Path, audio_src: Path | None, outdir: Path, plan: Plan, i
         cmd += ["-ss", f"{float(at):.6f}"]
     cmd += ["-i", str(src)]
     if audio_src is not None:
-        if start_index:
-            cmd += ["-ss", f"{float(at):.6f}"]
+        if at - audio_offset:
+            cmd += ["-ss", f"{float(at - audio_offset):.6f}"]
         cmd += ["-i", str(audio_src)]
     cmd += ["-map", f"0:{plan.video_idx}"]
     if audio_src is not None:

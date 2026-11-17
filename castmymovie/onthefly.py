@@ -260,6 +260,7 @@ class StreamOutcome:
     folder: Path                 # holds the audio pass's output and one subfolder of segments per cast attempt
     audio_path: Path | None
     plan: engine.Plan            # the plan the live encoder follows (audio already handled)
+    audio_offset: float = 0.0    # seconds audio_path starts after the source (see engine.audio_start_offset)
     curve: None = None
     on_the_fly: ClassVar[bool] = True
 
@@ -270,7 +271,7 @@ class StreamOutcome:
 
         def make_cmd(start_index: int) -> list:
             return engine.build_hls_cmd(sc.path, self.audio_path, workdir, self.plan, sc.info, self.analysis.max_mbps,
-                                        timeline.fps, timeline.seg_frames, start_index)
+                                        timeline.fps, timeline.seg_frames, start_index, self.audio_offset)
         return OnTheFly(timeline, make_cmd, workdir)
 
     def cleanup(self) -> None:
@@ -289,12 +290,13 @@ def prepare(sc: engine.Scan, an: engine.Analysis, progress: engine.ProgressFacto
         raise CastError(f"not enough disk space for the video segments: need ~{engine.fmt_size(need)}, "
                         f"have {engine.fmt_size(free)}")
     folder = Path(tempfile.mkdtemp(prefix=f"{FOLDER}{os.getpid()}-"))
-    audio_path = None
+    audio_path, audio_offset = None, 0.0
     try:
         if engine.needs_audio_pass(plan, sc.info):
             audio_path = folder / "audio.mka"
             engine.run_ffmpeg(engine.build_audio_cmd(sc.path, audio_path, plan, sc.info), sc.duration,
                               "Converting audio", progress)
+            audio_offset = engine.audio_start_offset(audio_path, sc.info)
             a = next(s for s in sc.info["streams"] if s["index"] == plan.audio_idx)
             plan = dataclasses.replace(plan, audio="copy",
                                        audio_out_kbps=engine.audio_out_kbps(min(int(a.get("channels", 2) or 2), 6)))
@@ -302,7 +304,8 @@ def prepare(sc: engine.Scan, an: engine.Analysis, progress: engine.ProgressFacto
     except BaseException:
         shutil.rmtree(folder, ignore_errors=True)
         raise
-    return StreamOutcome(sc.path, subs, sc.duration, time.monotonic() - started, sc, an, folder, audio_path, plan)
+    return StreamOutcome(sc.path, subs, sc.duration, time.monotonic() - started, sc, an, folder, audio_path, plan,
+                         audio_offset)
 
 
 def sweep_stale() -> None:
