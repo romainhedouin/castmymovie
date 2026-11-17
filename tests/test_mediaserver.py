@@ -276,15 +276,15 @@ class FakeStream:
     def wait_ready(self, segments, timeout):
         pass
 
-    def segment(self, n, timeout):
+    def segment(self, n, timeout, abandon=None):
         self.asked.append(n)
         deadline = time.monotonic() + timeout
         with self._cond:
             while n not in self._ready and not self.error:
                 left = deadline - time.monotonic()
-                if left <= 0:
+                if left <= 0 or (abandon is not None and abandon()):
                     return None
-                self._cond.wait(left)
+                self._cond.wait(min(left, 0.05))
             return self._ready.get(n)
 
     def close(self):

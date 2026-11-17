@@ -76,7 +76,7 @@ class FakeStream:
         if self.ready_error:
             raise self.ready_error
 
-    def segment(self, n, timeout):
+    def segment(self, n, timeout, abandon=None):
         path = self.folder / self.timeline.segment_name(n)
         path.write_bytes(bytes([n % 256]) * 1000)
         return path
