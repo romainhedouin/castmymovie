@@ -117,13 +117,15 @@ def fps_of(stream: dict) -> float:
 class StreamStats:
     bins: list = field(default_factory=list)  # bytes per second of media time
     total: int = 0
+    end: float = 0.0                          # where the last packet ends (its timestamp plus its duration)
 
-    def add(self, t: float, size: int) -> None:
+    def add(self, t: float, size: int, end: float = 0.0) -> None:
         i = int(max(t, 0))
         if i >= len(self.bins):
             self.bins.extend([0] * (i + 1 - len(self.bins)))
         self.bins[i] += size
         self.total += size
+        self.end = max(self.end, end)
 
     def avg_bps(self, duration: float) -> float:
         return self.total * 8 / duration if duration else 0.0
@@ -143,7 +145,7 @@ class StreamStats:
 def scan_bitrates(path: Path, duration: float, label: str = "Analyzing",
                   progress: ProgressFactory = NullProgress) -> dict:
     """Read every packet header (no decoding) to get true average and peak bitrates per stream."""
-    cmd = ["ffprobe", "-v", "error", "-show_entries", "packet=stream_index,pts_time,dts_time,size",
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "packet=stream_index,pts_time,dts_time,duration_time,size",
            "-of", "compact=p=0", str(path)]
     stats: dict = collections.defaultdict(StreamStats)
     bar = progress(label, duration)
@@ -158,7 +160,9 @@ def scan_bitrates(path: Path, duration: float, label: str = "Analyzing",
                 if t == "N/A" or "size" not in f:
                     continue
                 t = float(t)
-                stats[int(f["stream_index"])].add(t, int(f["size"]))
+                pts, dur = f.get("pts_time", "N/A"), f.get("duration_time", "N/A")
+                end = (t if pts == "N/A" else float(pts)) + (0.0 if dur == "N/A" else float(dur))
+                stats[int(f["stream_index"])].add(t, int(f["size"]), end)
                 latest = max(latest, t)
                 if n % 2000 == 0:
                     bar.update(latest)
@@ -250,6 +254,19 @@ class Scan:
     @property
     def subtitles(self) -> list:
         return [s for s in self.info["streams"] if s["codec_type"] == "subtitle"]
+
+    @property
+    def video_duration(self) -> float:
+        """Where the picture ends, on the clock of `duration`. `duration` is the longest stream's, and the sound (or a
+        subtitle) can run on after the last frame. Measured from the packets, as the containers' own figures are
+        often missing (MKV) or stale; `duration` when the packets tell nothing."""
+        st = self.stats.get(self.video["index"])
+        try:
+            start = float(self.info["format"].get("start_time") or 0)
+        except ValueError:
+            start = 0.0
+        end = st.end - (start if math.isfinite(start) else 0.0) if st else 0.0
+        return min(end, self.duration) if end > 0 else self.duration
 
     def video_peak_bps(self) -> float:
         st = self.stats.get(self.video["index"])
@@ -593,14 +610,16 @@ def build_audio_cmd(src: Path, dst: Path, plan: Plan, info: dict) -> list:
 
 
 def build_hls_cmd(src: Path, audio_src: Path | None, outdir: Path, plan: Plan, info: dict, max_mbps: float,
-                  fps: Fraction, seg_frames: int, start_index: int = 0) -> list:
+                  fps: Fraction, seg_frames: int, start_index: int = 0, end: float = 0.0) -> list:
     """Encode the video into `seg%05d.ts` segments of exactly `seg_frames` frames, numbered from `start_index`.
 
     The GOP is a fixed frame count, not a duration: that makes every segment last exactly seg_frames/fps, so the
     playlist the TV gets can state the lengths before they exist. Segment i then starts at i * seg_frames / fps on the
     movie's clock. A run that starts mid-movie seeks both inputs there and shifts its timestamps by the same amount
     (plus the reorder delay the first run has naturally), so segments from different runs join without a gap.
-    `audio_src` is the audio pass's output; without it the chosen track is copied from `src` (TS-compatible codecs only)."""
+    `audio_src` is the audio pass's output; without it the chosen track is copied from `src` (TS-compatible codecs only).
+    `end` (`Scan.video_duration`) cuts the sound where the picture ends: a segment can only begin at a frame, so sound
+    that runs on after the last one would all be crammed into the last segment, past the end the playlist states."""
     v = next(s for s in info["streams"] if s["index"] == plan.video_idx)
     at = start_index * seg_frames / fps
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-progress", "pipe:1", "-nostats", "-y"]
@@ -621,6 +640,8 @@ def build_hls_cmd(src: Path, audio_src: Path | None, outdir: Path, plan: Plan, i
             "-g", str(seg_frames), "-keyint_min", str(seg_frames), "-sc_threshold", "0"]
     if plan.audio_idx is not None:
         cmd += ["-c:a", "copy", "-copypriorss", "0"]  # without it a seeked copy starts at the previous packet cluster
+    if end:
+        cmd += ["-t", f"{float(end - at):.6f}"]
     cmd += ["-muxdelay", "0", "-muxpreload", "0"]
     if start_index:
         cmd += ["-output_ts_offset", f"{float(at + TS_REORDER_FRAMES / fps):.6f}"]
