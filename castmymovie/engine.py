@@ -599,7 +599,10 @@ def build_hls_cmd(src: Path, audio_src: Path | None, outdir: Path, plan: Plan, i
     cmd += ["-muxdelay", "0", "-muxpreload", "0"]
     if start_index:
         cmd += ["-output_ts_offset", f"{float(at + TS_REORDER_FRAMES / fps):.6f}"]
-    cmd += ["-f", "hls", "-hls_time", str(SEG_SECONDS), "-hls_list_size", "0", "-hls_segment_type", "mpegts",
+    # ffmpeg cuts segment n at the first keyframe at least n × hls_time past the start. Half a frame under the GOP's
+    # length cuts at every keyframe; 6 s would skip one whenever the GOP is a bit shorter (143 frames at 23.9 fps)
+    hls_time = (seg_frames - Fraction(1, 2)) / fps
+    cmd += ["-f", "hls", "-hls_time", f"{float(hls_time):.6f}", "-hls_list_size", "0", "-hls_segment_type", "mpegts",
             "-hls_flags", "temp_file+independent_segments", "-start_number", str(start_index),
             "-hls_segment_filename", str(outdir / "seg%05d.ts"), str(outdir / "ffmpeg.m3u8")]
     return cmd

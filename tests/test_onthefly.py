@@ -107,6 +107,36 @@ class Commands(unittest.TestCase):
         self.assertFalse(engine.needs_audio_pass(engine.Plan(video="encode", audio="none"), info()))
 
 
+AWKWARD = (Fraction(239, 10), Fraction(249, 10), Fraction(2987, 100), Fraction(8641, 420))  # 6 x fps rounds down
+
+
+def hls_cuts(seg_frames: int, fps: Fraction, hls_time: Fraction, count: int) -> list:
+    """The keyframes ffmpeg's HLS muxer starts the segments at: segment n at the first one n x hls_time or more past
+    the start. The keyframes are seg_frames apart (the GOP)."""
+    cuts, k = [0], 0
+    while len(cuts) < count:
+        k += 1
+        if k * seg_frames / fps >= len(cuts) * hls_time:
+            cuts.append(k)
+    return cuts
+
+
+class SegmentCuts(unittest.TestCase):
+    def test_a_rate_where_six_seconds_rounds_down_has_segments_under_six_seconds(self):
+        t = Timeline(60, Fraction(239, 10))
+        self.assertEqual((t.seg_frames, t.count), (143, 11))
+        self.assertAlmostEqual(t.seg_len, 5.98326, places=5)
+        self.assertAlmostEqual(t.start(10), 10 * 143 / 23.9)
+        self.assertIn("#EXT-X-TARGETDURATION:6", t.playlist().decode())
+
+    def test_ffmpeg_cuts_at_every_keyframe_so_segment_i_starts_where_the_playlist_says(self):
+        for fps in engine.STANDARD_RATES + list(AWKWARD):
+            t = Timeline(3 * 3600, fps)
+            cmd = engine.build_hls_cmd(Path("/m/a.mkv"), None, Path("/t"), plan(), info(), 6.0, t.fps, t.seg_frames)
+            hls_time = Fraction(cmd[cmd.index("-hls_time") + 1])
+            self.assertEqual(hls_cuts(t.seg_frames, t.fps, hls_time, t.count), list(range(t.count)), fps)
+
+
 # ---------------------------------------------------------------- the restart policy, with a fake encoder
 
 FAKE = r"""
@@ -366,6 +396,30 @@ class RealEncoder(unittest.TestCase):
         work = s.workdir
         s.close()
         self.assertFalse(work.exists())
+
+
+@unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not installed")
+class AwkwardRate(unittest.TestCase):
+    """23.9 fps: a segment is 143 frames, 5.983 s, a bit under 6 s."""
+
+    def test_every_segment_is_written_and_starts_where_the_playlist_says(self):
+        with tempfile.TemporaryDirectory(prefix="castmymovie-test-otf-") as tmp:
+            d = Path(tmp)
+            ff("-f", "lavfi", "-i", "testsrc2=size=64x36:rate=239/10:duration=20", "-c:v", "libx264", "-preset",
+               "ultrafast", str(d / "movie.mkv"))
+            sc = engine.scan(d / "movie.mkv")
+            t = Timeline(sc.duration, engine.cfr_rate(sc.video))
+            self.assertEqual((t.fps, t.seg_frames, t.count), (Fraction(239, 10), 143, 4))
+            for start in (0, 2):  # the first run, and a restart after a seek
+                out = d / f"from{start}"
+                out.mkdir()
+                subprocess.run(engine.build_hls_cmd(sc.path, None, out, plan(audio="none", audio_idx=None), sc.info, 6.0,
+                                                    t.fps, t.seg_frames, start), stdout=subprocess.DEVNULL, check=True)
+                self.assertEqual(sorted(p.name for p in out.glob("seg*.ts")),
+                                 [t.segment_name(i) for i in range(start, t.count)])
+                for i in range(start, t.count):
+                    self.assertAlmostEqual(probe_first_pts(out / t.segment_name(i), "v"), t.start(i) + 2 / float(t.fps),
+                                           delta=0.02, msg=f"run from {start}, segment {i}")
 
 
 @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not installed")
