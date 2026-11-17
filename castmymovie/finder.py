@@ -22,7 +22,11 @@ class Found:
 
 def default_roots() -> list:
     home = Path.home()
-    roots = [Path.cwd(), home / "Downloads", home / "Movies", home / "Desktop", home / "Documents"]
+    roots = [home / "Downloads", home / "Movies", home / "Desktop", home / "Documents"]
+    try:
+        roots.insert(0, Path.cwd())
+    except OSError:  # the terminal's folder was deleted (or can't be read): search the others
+        pass
     seen, out = set(), []
     for r in roots:
         try:
