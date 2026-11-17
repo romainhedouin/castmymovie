@@ -61,7 +61,8 @@ Prefer pipx? `pipx install .` works too.
    remux that takes seconds, or a slower re-encode.
 4. **It converts and verifies.** Progress bar with speed and ETA. Ctrl-C stops cleanly and leaves no partial
    file. The result is saved next to the original as `<name>.cast.mp4` (the original is never touched), with
-   text subtitles as `.vtt` files.
+   text subtitles as `<name>.cast.<lang>.vtt` files (even when the movie plays as it is, so your own `.vtt`
+   files are never overwritten).
 5. **It casts.** It finds your TVs, asks where to start (`1:12:30`, or Enter for the beginning), and plays
    with a live panel: position, buffer, link health, and keys.
 

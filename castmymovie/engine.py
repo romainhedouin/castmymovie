@@ -655,7 +655,8 @@ def run_ffmpeg(cmd: list, duration: float, label: str, progress: ProgressFactory
 
 
 def export_subtitles(src: Path, base: Path, subs: list, lang: str | None = None) -> list:
-    """Write text subtitle tracks as <base>.<lang>.vtt next to the video."""
+    """Write text subtitle tracks as <base>.<lang>.vtt next to the video. Pass `output_path(src)` as `base`: those
+    names are ours to replace, unlike a <name>.<lang>.vtt the user may keep next to the movie."""
     made, used = [], collections.Counter()
     for s in subs:
         if s.get("codec_name") not in TEXT_SUBS:
@@ -666,12 +667,16 @@ def export_subtitles(src: Path, base: Path, subs: list, lang: str | None = None)
         used[code] += 1
         suffix = code if used[code] == 1 else f"{code}{used[code]}"
         out = base.with_name(f"{base.stem}.{suffix}.vtt")
-        p = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(src),
-                            "-map", f"0:{s['index']}", "-c:s", "webvtt", str(out)], capture_output=True, text=True)
-        if p.returncode == 0 and out.exists() and out.stat().st_size > 0:
-            made.append(out)
-        else:
-            out.unlink(missing_ok=True)
+        part = out.with_name(out.name + ".part")  # a Ctrl-C midway leaves no half-written .vtt
+        try:
+            p = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(src),
+                                "-map", f"0:{s['index']}", "-c:s", "webvtt", "-f", "webvtt", str(part)],
+                               capture_output=True, text=True)
+            if p.returncode == 0 and part.exists() and part.stat().st_size > 0:
+                os.replace(part, out)
+                made.append(out)
+        finally:
+            part.unlink(missing_ok=True)
     return made
 
 
@@ -758,7 +763,7 @@ def _finish(sc: Scan, an: Analysis, video: Path, converted: bool, started: float
     if video != sc.path:
         ver = verify(video, sc.duration, an.plan.audio != "none", an.max_mbps, progress)
     curve = ver.curve if ver else cumulative_curve(sc.stats, sc.duration)
-    subs = export_subtitles(sc.path, video, sc.subtitles)
+    subs = export_subtitles(sc.path, output_path(sc.path), sc.subtitles)  # .cast.<lang>.vtt, even as-is
     return Outcome(video, converted, ver, subs, time.monotonic() - started, curve, sc.duration)
 
 
