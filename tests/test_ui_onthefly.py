@@ -96,9 +96,10 @@ class Question(unittest.TestCase):
                 self.assertIn(WHEN, script.asked)
 
     def test_it_is_not_asked_for_as_is_remux_or_audio_only_plans(self):
-        for name, mode in (("good.mp4", "as-is"), ("plain.mkv", "remux"), ("hevc_ac3.mkv", "re-encode")):
+        for name, mode, codec in (("good.mp4", "as-is", ()), ("plain.mkv", "remux", ()),
+                                  ("hevc_ac3.mkv", "re-encode", ("hevc",))):   # HEVC kept: its question comes first
             with self.subTest(name):
-                script = Script(WEAK)           # anything else asked would raise
+                script = Script(*codec, WEAK)   # anything else asked would raise
                 w, _ = make_wizard(script)
                 outcome = w.prepare(self.d / name)
                 self.assertNotIn(WHEN, script.asked)

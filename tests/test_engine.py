@@ -93,7 +93,6 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(streams(out.video, "audio")[0]["codec_name"], "aac")
         self.assertTrue(out.verification.ok, out.verification.problems)
 
-    @unittest.skipUnless(sys.platform == "darwin", "HEVC is only trusted on macOS")
     def test_hevc_kept_audio_converted(self):
         sc, an, out = pipeline(self.d / "hevc_ac3.mkv")
         v, a = streams(out.video, "video")[0], streams(out.video, "audio")[0]
@@ -258,7 +257,7 @@ class EndToEnd(unittest.TestCase):
         info = {"format": {"format_name": "matroska,webm"},
                 "streams": [{"index": 0, "codec_type": "video", "width": 640, "height": 360},
                             {"index": 1, "codec_type": "audio", "channels": 2}]}   # no codec_name, as ffprobe prints them
-        an = engine.analyze(engine.Scan(Path("x.mkv"), info, {}, 60.0, None))
+        an = engine.analyze(engine.Scan(Path("x.mkv"), info, {}, 60.0))
         self.assertEqual((an.plan.video, an.plan.audio), ("encode", "encode"))
 
 

@@ -18,6 +18,11 @@ does what it does with any online video: it downloads ahead, pauses and rebuffer
 together* when the Wi-Fi dips, and seeks by asking for a different part of the file (HTTP Range requests).
 Nothing is re-encoded on the way: the file plays exactly as prepared, 5.1 sound included.
 
+Since the TV's own player decodes the movie, what it can play depends on the TV, not on the Mac. H.264 plays on
+every Cast device. HEVC plays on the Chromecast Ultra, the Chromecast with Google TV and most Google TV sets, but
+not on the older Chromecasts. A Cast device does not tell a sender which codecs it decodes, and the movie is
+prepared before the TV is picked, so for an HEVC movie the wizard asks, and keeps HEVC unless told not to.
+
 The Cast sender is written from scratch (`nativecast.py` on top of `castlink.py`, with `zeroconf` for
 finding TVs): there is no Cast library. castmymovie keeps a control connection to the TV for the panel and
 the keys, and looks after the cast:
