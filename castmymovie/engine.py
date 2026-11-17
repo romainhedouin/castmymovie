@@ -235,12 +235,18 @@ class Scan:
         """Where the picture ends, on the clock of `duration`. `duration` is the longest stream's, and the sound (or a
         subtitle) can run on after the last frame. Measured from the packets, as the containers' own figures are
         often missing (MKV) or stale; `duration` when the packets tell nothing."""
-        st = self.stats.get(self.video["index"])
+        return self.streams_duration(self.video["index"])
+
+    def streams_duration(self, *indices: int | None) -> float:
+        """Where the last of these streams ends, on the clock of `duration`; `duration` when the packets tell nothing.
+        A converted file holds only the video and the chosen audio, so this, not `duration`, is the length it should
+        have: a subtitle cue running on past the movie must not fail verification."""
         try:
             start = float(self.info["format"].get("start_time") or 0)
         except ValueError:
             start = 0.0
-        end = st.end - (start if math.isfinite(start) else 0.0) if st else 0.0
+        ends = [st.end for i in indices if i is not None and (st := self.stats.get(i))]
+        end = max(ends, default=0.0) - (start if math.isfinite(start) else 0.0)
         return min(end, self.duration) if end > 0 else self.duration
 
     def video_peak_bps(self) -> float:
@@ -675,6 +681,7 @@ def export_subtitles(src: Path, base: Path, subs: list, lang: str | None = None)
         code = s.get("tags", {}).get("language", "und")
         if lang and norm_lang(code) != norm_lang(lang):
             continue
+        code = "".join(c if c.isalnum() or c == "-" else "-" for c in code).strip("-") or "und"  # "en/us" -> "en-us"
         used[code] += 1
         suffix = code if used[code] == 1 else f"{code}{used[code]}"
         out = base.with_name(f"{base.stem}.{suffix}.vtt")
@@ -777,7 +784,8 @@ def _finish(sc: Scan, an: Analysis, video: Path, converted: bool, started: float
             progress: ProgressFactory) -> Outcome:
     ver = None
     if video != sc.path:
-        ver = verify(video, sc.duration, an.plan.audio != "none", an.max_mbps, progress,
+        ver = verify(video, sc.streams_duration(an.plan.video_idx, an.plan.audio_idx), an.plan.audio != "none",
+                     an.max_mbps, progress,
                      h264=an.plan.video == "encode")
     curve = ver.curve if ver else cumulative_curve(sc.stats, sc.duration)
     subs = export_subtitles(sc.path, output_path(sc.path), sc.subtitles)  # .cast.<lang>.vtt, even as-is
