@@ -251,7 +251,8 @@ class Wizard:
         self.show_facts(sc, audio_index)
 
         self.step(3, "Choose the quality")
-        an = self.pick_quality(sc, audio_index)
+        force_h264 = self.pick_codec(sc, audio_index)
+        an = self.pick_quality(sc, audio_index, force_h264)
         self.show_report(an)
 
         if an.plan.video == "encode" and self.pick_when(an) == "otf":
@@ -333,10 +334,20 @@ class Wizard:
             return "remux + audio"  # only the sound is converted: seconds, not a slow video encode
         return {"as-is": "ready as is", "remux": "instant remux", "re-encode": "re-encode (slow)"}[an.plan.mode]
 
-    def pick_quality(self, sc: engine.Scan, audio_index: int | None) -> engine.Analysis:
+    def pick_codec(self, sc: engine.Scan, audio_index: int | None) -> bool:
+        """True to re-encode an HEVC movie to H.264. The TV decodes the video and does not tell us whether it can, so
+        this is asked, and only when the HEVC could be kept (at the "Original" quality)."""
+        if sc.video.get("codec_name") != "hevc" or \
+                engine.analyze(sc, engine.NO_CAP_MBPS, audio_index=audio_index).plan.video != "copy":
+            return False
+        return self.prompt.select("This movie is HEVC (H.265). Can your TV play HEVC?", [
+            ("Yes, keep HEVC (Google TV, Chromecast with Google TV, Chromecast Ultra)", "hevc"),
+            ("No, convert to H.264 (older Chromecasts; a slow re-encode)", "h264")], default="hevc") == "h264"
+
+    def pick_quality(self, sc: engine.Scan, audio_index: int | None, force_h264: bool = False) -> engine.Analysis:
         choices = []
         for name, mbps, who in PRESETS:
-            an = engine.analyze(sc, mbps, audio_index=audio_index)
+            an = engine.analyze(sc, mbps, force_h264=force_h264, audio_index=audio_index)
             limit = "no cap" if mbps >= engine.NO_CAP_MBPS else f"{mbps:g} Mbit/s"
             choices.append((f"{name:<12}{limit:<10} {self.preview(an):<17} {who}", mbps))
         choices.append(("Custom…", "custom"))
@@ -351,7 +362,7 @@ class Wizard:
                 except ValueError:
                     pass
                 self.console.print("[warn]Enter a number such as 8 or 12.5[/]")
-        return engine.analyze(sc, pick, audio_index=audio_index)
+        return engine.analyze(sc, pick, force_h264=force_h264, audio_index=audio_index)
 
     def show_report(self, an: engine.Analysis) -> None:
         t = Table.grid(padding=(0, 2))

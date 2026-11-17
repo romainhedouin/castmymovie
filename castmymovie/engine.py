@@ -13,11 +13,8 @@ import collections
 import json
 import math
 import os
-import plistlib
-import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -32,7 +29,6 @@ WINDOW_S = 10
 PEAK_TOLERANCE = 1.05
 MAX_W, MAX_H = 1920, 1080  # Chrome tab mirroring tops out at 1080p
 MAX_FPS = 30.5  # ... and at 30 fps by default
-CHROME_MIN_HEVC = 107  # first Chrome with hardware HEVC decode
 SEG_SECONDS = 6  # length of a cast-on-the-fly HLS segment (see onthefly.py)
 
 H264_PROFILES = {"Baseline", "Constrained Baseline", "Main", "High"}
@@ -207,26 +203,6 @@ def mdat_offset(path: Path) -> int | None:
     return next((at for kind, at in mp4_boxes(path) if kind == "mdat"), None)
 
 
-def chrome_major() -> int | None:
-    candidates = [
-        ("plist", "/Applications/Google Chrome.app/Contents/Info.plist"),
-        ("cmd", "google-chrome"), ("cmd", "google-chrome-stable"), ("cmd", "chromium"),
-    ]
-    for kind, target in candidates:
-        try:
-            if kind == "plist" and os.path.exists(target):
-                with open(target, "rb") as f:
-                    return int(plistlib.load(f)["CFBundleShortVersionString"].split(".")[0])
-            if kind == "cmd" and shutil.which(target):
-                out = subprocess.run([target, "--version"], capture_output=True, text=True, timeout=10).stdout
-                m = re.search(r"(\d+)\.", out)
-                if m:
-                    return int(m.group(1))
-        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
-            continue
-    return None
-
-
 @dataclass
 class Scan:
     """Everything we learn from reading the file once. Independent of the bitrate the user picks."""
@@ -234,7 +210,6 @@ class Scan:
     info: dict
     stats: dict
     duration: float
-    chrome: int | None
 
     @property
     def video(self) -> dict:
@@ -268,7 +243,7 @@ def scan(path: Path, progress: ProgressFactory = NullProgress) -> Scan:
     duration = float(info["format"].get("duration") or 0)
     if duration <= 0:
         raise CastError("could not determine the duration")
-    s = Scan(path, info, {}, duration, chrome_major())
+    s = Scan(path, info, {}, duration)
     s.video  # raises early when there is no video
     s.stats = scan_bitrates(path, duration, "Analyzing", progress)
     return s
@@ -350,7 +325,10 @@ def pick_audio(audios: list, lang: str | None) -> dict | None:
 
 def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = False,
             lang: str | None = None, audio_index: int | None = None) -> Analysis:
-    """What the file needs to play on a TV that plays the file itself."""
+    """What the file needs to play on a TV that plays the file itself.
+
+    The TV decodes the video, so only its owner knows whether it plays HEVC: `force_h264` re-encodes HEVC for one
+    that does not (the Chromecasts before the Ultra)."""
     path, info, stats, duration = sc.path, sc.info, sc.stats, sc.duration
     v, audios, subs = sc.video, sc.audios, sc.subtitles
     a = next((x for x in audios if x["index"] == audio_index), None) if audio_index is not None \
@@ -383,7 +361,6 @@ def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = Fal
     codec, pix = v.get("codec_name", "unknown"), v.get("pix_fmt", "")  # ffprobe omits the name of a codec it does not know
     level = int(v.get("level", 0) or 0)
     level = 0 if level < 0 else level
-    hevc_ok = sys.platform == "darwin" and (sc.chrome is None or sc.chrome >= CHROME_MIN_HEVC)
     why: list[str] = []
     if codec == "h264":
         if v.get("profile") not in H264_PROFILES:
@@ -396,11 +373,9 @@ def analyze(sc: Scan, max_mbps: float = DEFAULT_MAX_MBPS, force_h264: bool = Fal
     elif codec == "hevc":
         detail = f"HEVC {v.get('profile')}, {pix}"
         if force_h264:
-            why.append("H.264 requested (older Chromecast)")
-        elif not hevc_ok:
-            why.append("cannot confirm Chrome hardware HEVC decoding on this machine")
+            why.append("H.264 chosen (TV without HEVC)")
         elif pix not in HEVC_PIX_FMTS:
-            why.append(f"{pix} is not decodable in Chrome")
+            why.append(f"{pix} (HEVC needs 8- or 10-bit 4:2:0)")
         elif level > HEVC_MAX_LEVEL:
             why.append("HEVC level above 5.1")
     elif codec in ("vp8", "vp9") and is_webm:
@@ -713,8 +688,9 @@ class Verification:
 
 
 def verify(out: Path, src_duration: float, wants_audio: bool, max_mbps: float,
-           progress: ProgressFactory = NullProgress) -> Verification:
-    """Re-probe the finished file: duration, streams, index position, peak bitrate, test decode."""
+           progress: ProgressFactory = NullProgress, h264: bool = False) -> Verification:
+    """Re-probe the finished file: duration, streams (H.264 video if `h264`), index position, peak bitrate, test
+    decode."""
     info = probe(out)
     problems = []
     got = float(info["format"].get("duration") or 0)
@@ -723,6 +699,10 @@ def verify(out: Path, src_duration: float, wants_audio: bool, max_mbps: float,
     kinds = [s["codec_type"] for s in info["streams"]]
     if "video" not in kinds:
         problems.append("output has no video")
+    elif h264:
+        vcodec = next(s for s in info["streams"] if s["codec_type"] == "video").get("codec_name", "unknown")
+        if vcodec != "h264":  # an output from an earlier run that kept HEVC, reused now that the TV needs H.264
+            problems.append(f"video is {vcodec.upper()}, not H.264: convert again (overwrite)")
     if wants_audio and "audio" not in kinds:
         problems.append("output has no audio")
     if not mp4_is_faststart(out):
@@ -756,7 +736,8 @@ def _finish(sc: Scan, an: Analysis, video: Path, converted: bool, started: float
             progress: ProgressFactory) -> Outcome:
     ver = None
     if video != sc.path:
-        ver = verify(video, sc.duration, an.plan.audio != "none", an.max_mbps, progress)
+        ver = verify(video, sc.duration, an.plan.audio != "none", an.max_mbps, progress,
+                     h264=an.plan.video == "encode")
     curve = ver.curve if ver else cumulative_curve(sc.stats, sc.duration)
     subs = export_subtitles(sc.path, video, sc.subtitles)
     return Outcome(video, converted, ver, subs, time.monotonic() - started, curve, sc.duration)

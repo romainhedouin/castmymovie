@@ -58,7 +58,8 @@ Prefer pipx? `pipx install .` works too.
    or type or drag in a path. `castmymovie path/to/movie.mkv` skips the list.
 2. **It checks the file** (about 4 s for a 2 GB movie), including the real bitrate profile.
 3. **You choose the quality.** Each option previews what it will do to *your* movie: nothing, a lossless
-   remux that takes seconds, or a slower re-encode.
+   remux that takes seconds, or a slower re-encode. For an HEVC (H.265) movie it first asks whether your TV
+   plays HEVC: keep it (the default), or convert it to H.264 for an older Chromecast.
 4. **It converts and verifies.** Progress bar with speed and ETA. Ctrl-C stops cleanly and leaves no partial
    file. The result is saved next to the original as `<name>.cast.mp4` (the original is never touched), with
    text subtitles as `.vtt` files.
@@ -117,7 +118,7 @@ behind 6 Mbit/s is in [how it works](docs/how-it-works.md#why-6-mbits-for-24-ghz
 | Check | Passes when | Otherwise |
 |---|---|---|
 | Container | MP4 (or WebM) with the index at the front | remux to MP4 + `faststart` |
-| Video codec | H.264 Baseline/Main/High, 8-bit 4:2:0, level ≤ 4.2; or HEVC ≤ 5.1 if this Mac's Chrome (≥ 107) can hardware-decode it | re-encode to H.264 |
+| Video codec | H.264 Baseline/Main/High, 8-bit 4:2:0, level ≤ 4.2; or HEVC 8/10-bit 4:2:0, level ≤ 5.1, unless you said your TV does not play HEVC | re-encode to H.264 |
 | Resolution | ≤ 1920×1080 | downscale |
 | Scan type | progressive | deinterlace |
 | Audio | AAC / MP3 / Opus / FLAC, ≤ 5.1 | convert to AAC (stereo 192 kbit/s, 5.1 384 kbit/s) |
@@ -140,8 +141,10 @@ download it*. The TV downloads the movie from the Mac, so it must be able to rea
 - The movie is only served to the address the TV was found at. If castmymovie says it *turned away* another
   address, that is probably the TV: choose *Enter an IP address…* and type that one.
 
-If the TV downloaded part of the movie and still refused it, its player cannot decode the file (HEVC on an
-older TV, say). A lower Wi-Fi option re-encodes high-bitrate files to plain H.264.
+If the TV downloaded part of the movie and still refused it, its player cannot decode the file (HEVC on a
+Chromecast older than the Ultra, say). Run castmymovie again and answer *No, convert to H.264* when it asks
+whether your TV plays HEVC. If it says the `.cast.mp4` already exists, choose *Convert again*: the existing
+one still has the HEVC video.
 
 **Stutters or buffers a lot.** Your Wi-Fi to the TV is the weak link, not the file. In order of impact: move
 the TV to 5 GHz; set a fixed 2.4 GHz channel (1, 6 or 11) instead of Auto; put the Mac on 5 GHz or Ethernet
@@ -159,7 +162,6 @@ address; the secret part of the movie's web address is written as `***`.
 - Subtitles: the TV's player shows the `.vtt` file you pick at the cast step.
 - HDR sources are flagged, not tone-mapped. Image-based subtitles (PGS/VobSub) can't be converted.
 - One video stream and one audio track are kept (you are asked when there are several).
-- HEVC is only kept on macOS; elsewhere it is re-encoded to H.264.
 - The TV must be able to reach the Mac over the network.
 - Tested against a Xiaomi Google TV; other Cast receivers should work but are untested.
 
