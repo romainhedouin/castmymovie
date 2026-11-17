@@ -4,7 +4,8 @@ Converting a whole movie before the first frame can take most of an hour. Here f
 segments of 6 seconds (MPEG-TS, H.264 + AAC) into a temp folder and the TV plays them as they appear:
 
 - The TV is given the complete VOD playlist from the start, generated from the movie's length (`Timeline`), so it
-  shows the full duration and a normal seek bar. The segments only have to exist when the TV asks for them.
+  shows the full duration and a normal seek bar. The segments only have to exist when the TV asks for them. That
+  length is the picture's: a segment can only begin at a frame, so sound that runs on after the last one is cut.
 - `OnTheFly.segment(n)` hands out segment n, waiting for the encoder when it is about to get there. When the TV asks
   for one far from where the encoder is (a seek), ffmpeg is restarted at that segment. Segments already written stay
   on disk, so seeking back is instant, and an encoder that reaches a segment written earlier stops there.
@@ -253,7 +254,7 @@ class StreamOutcome:
     """What the wizard gets instead of an `engine.Outcome` when the movie is cast on the fly."""
     video: Path                  # the source movie (the TV shows its name; nothing is played from it directly)
     subtitles: list
-    duration: float
+    duration: float              # where the picture ends (`Scan.video_duration`): the stream stops there
     seconds: float
     scan: engine.Scan
     analysis: engine.Analysis
@@ -271,7 +272,8 @@ class StreamOutcome:
 
         def make_cmd(start_index: int) -> list:
             return engine.build_hls_cmd(sc.path, self.audio_path, workdir, self.plan, sc.info, self.analysis.max_mbps,
-                                        timeline.fps, timeline.seg_frames, start_index, self.audio_offset)
+                                        timeline.fps, timeline.seg_frames, start_index,
+                                        audio_offset=self.audio_offset, end=self.duration)
         return OnTheFly(timeline, make_cmd, workdir)
 
     def cleanup(self) -> None:
@@ -304,8 +306,8 @@ def prepare(sc: engine.Scan, an: engine.Analysis, progress: engine.ProgressFacto
     except BaseException:
         shutil.rmtree(folder, ignore_errors=True)
         raise
-    return StreamOutcome(sc.path, subs, sc.duration, time.monotonic() - started, sc, an, folder, audio_path, plan,
-                         audio_offset)
+    return StreamOutcome(sc.path, subs, sc.video_duration, time.monotonic() - started, sc, an, folder, audio_path,
+                         plan, audio_offset)
 
 
 def sweep_stale() -> None:

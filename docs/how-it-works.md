@@ -42,7 +42,9 @@ See the README for what it does and when it is offered. Under the hood:
 - ffmpeg writes 6 s MPEG-TS segments (H.264 + AAC) with a fixed frame-count GOP, so every segment is exactly
   `round(6 × fps) / fps` long (6.006 s at 23.976 fps).
 - The TV gets a complete VOD playlist generated up front from the movie's duration, which is why the full
-  length and the seek bar are there from the first second.
+  length and the seek bar are there from the first second. That duration is the picture's: a segment can
+  only begin at a video frame, so sound that runs on after the last frame (rare, and usually a fraction of
+  a second) is cut there. A full conversion keeps it.
 - The server holds a segment request until the encoder has written it. A request far from the encoder (a
   seek) restarts ffmpeg at that segment (`-ss`, `-start_number`, `-output_ts_offset`). Segments already
   written stay on disk, and an encoder run stops when it reaches a segment an earlier run wrote.
