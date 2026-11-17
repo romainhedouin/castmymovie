@@ -93,6 +93,30 @@ class Commands(unittest.TestCase):
         self.assertIn("-copypriorss", cmd)
         self.assertEqual(cmd[cmd.index("-map", cmd.index("-map") + 1) + 1], "1:0")  # the sidecar's only track
 
+    def test_a_sidecar_that_starts_late_is_seeked_by_its_delay_less(self):
+        def seeks(start_index, offset):
+            cmd = engine.build_hls_cmd(Path("/m/a.mkv"), Path("/t/audio.mka"), Path("/t"), plan(), info(), 6.0, NTSC, 144,
+                                       start_index, offset)
+            first, second = cmd.index("-i"), cmd.index("-i", cmd.index("-i") + 1)
+            return [cmd[i - 1] if cmd[i - 2] == "-ss" else None for i in (first, second)]
+        self.assertEqual(seeks(0, 1.0), [None, "-1.000000"])              # the first run: before the sidecar's start
+        self.assertEqual(seeks(3, 1.0), ["18.018000", "17.018000"])       # a restart: the same moment of the movie
+        self.assertEqual(seeks(3, 20.0), ["18.018000", "-1.982000"])      # a restart inside the delay
+        self.assertEqual(seeks(3, 18.018), ["18.018000", None])           # exactly at the sidecar's start
+        self.assertEqual(seeks(0, 0.0), [None, None])                     # no delay: as before
+
+    def test_without_a_sidecar_the_offset_changes_nothing(self):
+        args = (Path("/m/a.mkv"), None, Path("/t"), plan(), info(), 6.0, NTSC, 144)
+        for i in (0, 3):
+            self.assertEqual(engine.build_hls_cmd(*args, i, 1.0), engine.build_hls_cmd(*args, i))
+
+    def test_the_offset_is_where_the_sidecar_starts_on_the_sources_clock(self):
+        for sidecar, source, want in (("1.000000", "0.000000", 1.0), ("1.894000", "1.400000", 0.494),
+                                      ("0.000000", "0.000000", 0.0), (None, None, 0.0), ("1.4003", "1.400000", 0.0)):
+            with mock.patch.object(engine, "probe", return_value={"format": {"start_time": sidecar} if sidecar else {}}):
+                got = engine.audio_start_offset(Path("/t/audio.mka"), {"format": {"start_time": source} if source else {}})
+            self.assertEqual(got, want, (sidecar, source))
+
     def test_frame_rates_snap_to_the_standard_ones(self):
         for avg, want in (("24000/1001", NTSC), ("23976/1000", NTSC), ("25/1", Fraction(25)), ("2997/100", Fraction(30000, 1001)),
                           ("0/0", Fraction(24))):
@@ -396,6 +420,59 @@ class RealEncoder(unittest.TestCase):
         work = s.workdir
         s.close()
         self.assertFalse(work.exists())
+
+
+def first_beep_after_silence(path: Path) -> float:
+    """When the first beep that follows a silence starts, on the segment's own timestamps."""
+    err = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-copyts", "-i", str(path), "-map", "0:a",
+                          "-af", "silencedetect=noise=-30dB:d=0.05", "-f", "null", "-"], capture_output=True, text=True).stderr
+    return float(err.split("silence_end: ", 1)[1].split()[0])
+
+
+@unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not installed")
+class DelayedAudio(unittest.TestCase):
+    """A rip whose AC3 sound starts 1 s after the picture: the audio pass keeps the delay, and so must the segments."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = Path(tempfile.mkdtemp(prefix="castmymovie-test-otf-"))
+        cls.src = cls.dir / "movie.mkv"
+        # a 0.1 s beep every 2 s of the sound, which starts at 1 s: beeps at 1, 3, 5... s of the movie
+        ff("-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=20", "-itsoffset", "1",
+           "-f", "lavfi", "-i", r"aevalsrc=if(lt(mod(t\,2)\,0.1)\,0.8*sin(2*PI*1000*t)\,0):s=48000:d=19",
+           "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "800k", "-c:a", "ac3", str(cls.src))
+        sc = engine.scan(cls.src)
+        cls.out = onthefly.prepare(sc, engine.analyze(sc, 0.3))
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        cls.out.cleanup()
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def setUp(self):
+        self.stream = self.out.make_stream()
+
+    def tearDown(self):
+        self.stream.close()
+
+    def test_the_audio_pass_measures_the_delay(self):
+        self.assertAlmostEqual(self.out.audio_offset, 1.0, delta=0.01)
+
+    def test_the_first_segment_keeps_the_delay(self):
+        s = self.stream
+        s.begin(0)
+        s.wait_ready(1, 60)
+        seg = s._path(0)
+        self.assertAlmostEqual(probe_first_pts(seg, "a") - probe_first_pts(seg, "v"), 1.0, delta=0.05)
+
+    def test_a_run_from_the_middle_plays_the_sound_of_that_moment(self):
+        s = self.stream
+        s.begin(12)
+        s.wait_ready(1, 60)
+        i, reorder = s._run_start, 2 / float(s.timeline.fps)
+        self.assertEqual(i, 2)
+        self.assertAlmostEqual(first_beep_after_silence(s._path(i)), 13 + reorder, delta=0.05)  # not 14: a beep early
 
 
 @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not installed")
