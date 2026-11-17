@@ -31,7 +31,7 @@ class FakeStream:
     def wait_ready(self, segments, timeout):
         pass
 
-    def segment(self, n, timeout):
+    def segment(self, n, timeout, abandon=None):
         return None
 
     def status(self):

@@ -97,6 +97,7 @@ class OnTheFly:
         self._before: set = set()        # segments that existed when the run started (it stops on reaching one)
         self._speed: float | None = None
         self._pending: set = set()       # segments asked for that the encoder is not going to reach
+        self._caught_up = False          # the current run was stopped on reaching a segment an earlier run wrote
         self._closed = False
 
     # --- the surface the media server and the cast use
@@ -117,16 +118,19 @@ class OnTheFly:
                     raise CastError(f"The encoder did not produce the first seconds within {int(timeout)} s.")
                 self._cv.wait(0.05)
 
-    def segment(self, n: int, timeout: float) -> Path | None:
-        """Segment n once it exists. None when the encoder died or `timeout` ran out. Restarts the encoder when the
-        request is not something it will reach soon (a seek)."""
+    def segment(self, n: int, timeout: float, abandon: Callable[[], bool] | None = None) -> Path | None:
+        """Segment n once it exists. None when the encoder died, `timeout` ran out or `abandon()` (asked 20 times a
+        second) said to give up. Restarts the encoder when the request is not something it will reach soon (a seek).
+        Make one call per request: how long it has waited is what tells a seek from the next segment asked early."""
         deadline, asked = self.clock() + timeout, None
         path = self._path(n)
         with self._cv:
             while True:
                 if path.exists():
+                    self._pending.discard(n)
                     return path
-                if self.error or self._closed:
+                if self.error or self._closed or (abandon is not None and abandon()):
+                    self._pending.discard(n)
                     return None
                 now = self.clock()
                 self._advance()
@@ -177,7 +181,8 @@ class OnTheFly:
                 and self._cursor not in self._before:
             self._cursor += 1
         if self._proc is not None and self._proc.poll() is None and self._cursor in self._before:
-            self._proc.terminate()  # it is about to redo finished work
+            self._proc.kill()  # it is about to redo finished work (a kill: see _kill)
+            self._caught_up = True
 
     def _covers(self, n: int) -> bool:
         running = self._proc is not None and self._proc.poll() is None
@@ -188,12 +193,18 @@ class OnTheFly:
         old, self._proc = self._proc, None
         self._run += 1
         run = self._run
-        self._run_start = self._cursor = index
-        self._before = {i for i in range(self.timeline.count) if self._path(i).exists()}
-        self._speed = None
-        self._kill(old)  # ffmpeg answers terminate within a moment; holding the lock keeps restarts one at a time
+        self._kill(old)  # holding the lock keeps restarts one at a time
         if self._closed:
             return
+        try:
+            for tmp in self.workdir.glob("*.tmp"):  # a segment the old run had not renamed in yet
+                tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._run_start = self._cursor = index
+        self._before = {i for i in range(self.timeline.count) if self._path(i).exists()}  # after the kill: all final
+        self._speed = None
+        self._caught_up = False
         if self._errlog:
             self._errlog.close()
         self._errlog = tempfile.TemporaryFile(mode="w+")
@@ -208,14 +219,12 @@ class OnTheFly:
 
     @staticmethod
     def _kill(proc: subprocess.Popen | None) -> None:
+        """SIGKILL, not SIGTERM: on SIGTERM ffmpeg ends the segment it is writing where it is and renames it in, so a
+        stop would leave a segment cut short under its final name (or one cut short over a finished one)."""
         if proc is None or proc.poll() is not None:
             return
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        proc.kill()
+        proc.wait()
 
     def _read(self, proc: subprocess.Popen, run: int, errlog) -> None:
         for line in proc.stdout:  # ffmpeg -progress: a block of key=value lines every half second
@@ -236,7 +245,7 @@ class OnTheFly:
             if run != self._run or self._closed:
                 return  # we stopped it ourselves
             self._advance()
-            if code and not (self._cursor in self._before and code < 0):  # our own terminate() at a finished segment
+            if code and not self._caught_up:  # not our own kill at a finished segment
                 try:
                     errlog.seek(0)
                     tail = "\n".join(errlog.read().strip().splitlines()[-12:])

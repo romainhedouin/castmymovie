@@ -202,21 +202,20 @@ class _Handler(BaseHTTPRequestHandler):
         """(path, "") once the encoder has segment n; (None, why) when it will not come: "closed" (the server is
         stopping), "gone" (the TV hung up while waiting), "dead" (the encoder died), "timeout"."""
         owner: MediaServer = self.server.owner
-        deadline = time.monotonic() + owner.SEGMENT_WAIT
-        while True:
-            left = deadline - time.monotonic()
-            if owner.closed.is_set():
-                return None, "closed"
-            if left <= 0:
-                return None, "timeout"
-            path = owner.stream.segment(n, min(owner.WAIT_SLICE, left))
-            if path is not None:
-                return Path(path), ""
-            if owner.stream.error:
-                return None, "dead"
-            if self._peer_gone():
-                return None, "gone"
-            owner.closed.wait(0.02)   # segment() answering at once without a file must not turn this into a busy loop
+        if owner.closed.is_set():
+            return None, "closed"
+        # one call for the whole wait: the stream restarts the encoder for a request that has waited a while (a seek),
+        # which a wait cut into short slices never does; abandon() is how it notices a stop() or a TV that hung up
+        path = owner.stream.segment(n, owner.SEGMENT_WAIT, lambda: owner.closed.is_set() or self._peer_gone())
+        if path is not None:
+            return Path(path), ""
+        if owner.closed.is_set():
+            return None, "closed"
+        if owner.stream.error:
+            return None, "dead"
+        if self._peer_gone():
+            return None, "gone"
+        return None, "timeout"
 
     def _peer_gone(self) -> bool:
         """True when the TV closed its end of the connection (a request waits silently, so it would not notice)."""
@@ -247,7 +246,6 @@ class MediaServer:
     With `stream` (an onthefly.OnTheFly) it serves that instead of the file: the HLS playlist and its segments."""
 
     SEGMENT_WAIT = 45.0    # how long a request waits for the encoder to produce a segment before it is told to retry
-    WAIT_SLICE = 0.2       # a waiting request looks up this often for a stop() or a TV that hung up
 
     def __init__(self, media: Path, subtitles=(), allow=(), log: Callable[[str], None] | None = None, stream=None):
         self.media = Path(media)

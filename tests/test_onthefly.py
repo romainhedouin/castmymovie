@@ -113,12 +113,40 @@ FAKE = r"""
 import sys, time
 from pathlib import Path
 work, start, count, log = Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4])
+pause = float(sys.argv[5]) if len(sys.argv) > 5 else 0.04
 with log.open("a") as f:
     f.write(f"{start}\n")
 for i in range(start, count):
-    time.sleep(0.04)
+    time.sleep(pause)
     (work / f"seg{i:05d}.ts.tmp").write_bytes(b"x" * 100)
     (work / f"seg{i:05d}.ts.tmp").rename(work / f"seg{i:05d}.ts")
+    print("speed=9.0x", flush=True)
+time.sleep(30)
+"""
+
+# like ffmpeg on SIGTERM: the segment it is writing is renamed in, cut short, and it exits with 255
+FFMPEG_LIKE = r"""
+import signal, sys, time
+from pathlib import Path
+work, start, count, log = Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4])
+pause = float(sys.argv[5])
+with log.open("a") as f:
+    f.write(f"{start}\n")
+current = None
+def finish_early(*_):
+    try:
+        current.rename(current.with_suffix(""))
+    except (AttributeError, OSError):
+        pass
+    sys.exit(255)
+signal.signal(signal.SIGTERM, finish_early)
+for i in range(start, count):
+    current = work / f"seg{i:05d}.ts.tmp"
+    current.write_bytes(b"cut")
+    time.sleep(pause)
+    current.write_bytes(b"whole")
+    current.rename(work / f"seg{i:05d}.ts")
+    current = None
     print("speed=9.0x", flush=True)
 time.sleep(30)
 """
@@ -137,9 +165,9 @@ class FakeEncoder(unittest.TestCase):
         import shutil
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def make(self, script=FAKE, count=100):
-        s = OnTheFly(self.timeline, lambda i: [sys.executable, "-c", script, str(self.work), str(i), str(count), str(self.log)],
-                     self.work)
+    def make(self, script=FAKE, count=100, *extra):
+        s = OnTheFly(self.timeline, lambda i: [sys.executable, "-c", script, str(self.work), str(i), str(count), str(self.log),
+                                               *map(str, extra)], self.work)
         self.streams.append(s)
         return s
 
@@ -210,6 +238,44 @@ class FakeEncoder(unittest.TestCase):
         self.assertIsNone(s.error)
         self.assertTrue(all((self.work / f"seg{i:05d}.ts").exists() for i in (2, 3, 4, 5)))
 
+    def wait_for_exit(self, s):
+        deadline = time.monotonic() + 10
+        while s._proc.poll() is None and time.monotonic() < deadline:
+            s.status()
+            time.sleep(0.05)
+        self.assertIsNotNone(s._proc.poll())
+        time.sleep(0.2)  # the reader thread books the exit
+
+    def test_a_run_stopped_at_a_finished_segment_is_no_error_and_leaves_it_whole(self):
+        s = self.make(FFMPEG_LIKE, 100, 0.1)
+        self.work.mkdir(parents=True)
+        (self.work / "seg00005.ts").write_bytes(b"done")
+        s.begin(12)
+        self.wait_for_exit(s)
+        self.assertIsNone(s.error)
+        self.assertEqual((self.work / "seg00005.ts").read_bytes(), b"done")
+        self.assertEqual([(self.work / f"seg{i:05d}.ts").read_bytes() for i in (2, 3, 4)], [b"whole"] * 3)
+
+    def test_a_restart_leaves_no_segment_cut_short(self):
+        s = self.make(FFMPEG_LIKE, 100, 0.3)
+        s.begin(0)
+        s.wait_ready(1, 10)
+        self.assertIsNotNone(s.segment(60, 10))  # the first run is half way through a segment when it is stopped
+        self.assertEqual(self.launches(), [0, 60])
+        self.assertEqual({p.read_bytes() for p in self.work.glob("seg*.ts")}, {b"whole"})
+        self.assertTrue(all(int(p.name[3:8]) > 60 for p in self.work.glob("*.tmp")))  # only the new run's
+        self.assertIsNone(s.error)
+
+    def test_a_request_that_is_abandoned_returns_at_once_and_restarts_nothing(self):
+        s = self.make(FAKE, 100, 0.3)
+        s.begin(0)
+        s.wait_ready(1, 10)
+        t0, calls = time.monotonic(), []
+        self.assertIsNone(s.segment(60, 30, lambda: calls.append(1) or len(calls) > 2))
+        self.assertLess(time.monotonic() - t0, 1)
+        self.assertEqual(self.launches(), [0])
+        self.assertEqual(s._pending, set())
+
     def test_an_encoder_that_dies_is_reported_and_requests_fail_fast(self):
         s = self.make("import sys; sys.stderr.write('boom: no such codec'); sys.exit(3)")
         s.begin(0)
@@ -256,6 +322,73 @@ class FakeEncoder(unittest.TestCase):
         s.close()
         t.join(5)
         self.assertEqual(out, [None])
+
+
+class ThroughTheServer(unittest.TestCase):
+    """A slow encoder behind the real media server: a request is cut into nothing, so a seek restarts the encoder."""
+
+    def setUp(self):
+        from castmymovie.mediaserver import MediaServer
+        self.dir = Path(tempfile.mkdtemp(prefix="castmymovie-test-otf-"))
+        self.work, self.log = self.dir / "seg", self.dir / "launches"
+        self.stream = OnTheFly(Timeline(600, 25), lambda i: [sys.executable, "-c", FAKE, str(self.work), str(i), "100",
+                                                             str(self.log), "0.3"], self.work)
+        self.srv = MediaServer(self.dir / "movie.mkv", allow={"127.0.0.1"}, stream=self.stream)
+        self.srv.SEGMENT_WAIT = 4.0
+        self.srv.start(host="127.0.0.1")
+
+    def tearDown(self):
+        import shutil
+        self.srv.stop()
+        self.stream.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def get(self, n):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.srv.port, timeout=10)
+        try:
+            c.request("GET", f"/{self.srv.token}/seg{n:05d}.ts")
+            return c.getresponse().status
+        finally:
+            c.close()
+
+    def launches(self):
+        return [int(x) for x in self.log.read_text().split()]
+
+    def test_a_seek_far_ahead_restarts_the_encoder(self):
+        self.stream.begin(0)
+        self.stream.wait_ready(1, 10)
+        t0 = time.monotonic()
+        self.assertEqual(self.get(60), 200)
+        self.assertLess(time.monotonic() - t0, 3)
+        self.assertEqual(self.launches(), [0, 60])
+
+    def test_a_seek_back_restarts_the_encoder_which_stops_where_the_first_run_began(self):
+        self.stream.begin(300)
+        self.stream.wait_ready(1, 10)
+        self.assertEqual(self.get(49), 200)
+        self.assertEqual(self.launches(), [50, 49])
+        self.assertEqual(self.get(50), 200)
+        deadline = time.monotonic() + 5
+        while self.stream._proc.poll() is None and time.monotonic() < deadline:
+            self.stream.status()
+            time.sleep(0.05)
+        time.sleep(0.2)
+        self.assertIsNotNone(self.stream._proc.poll())
+        self.assertIsNone(self.stream.error)
+
+    def test_the_next_segment_asked_first_does_not_make_the_encoder_flap(self):
+        self.stream.begin(0)
+        self.stream.wait_ready(1, 10)
+        got = {}
+        threads = [threading.Thread(target=lambda n=n, d=d: (time.sleep(d), got.__setitem__(n, self.get(n))))
+                   for n, d in ((71, 0.0), (70, 0.1))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(15)
+        self.assertEqual(got, {70: 200, 71: 200})
+        self.assertEqual(self.launches(), [0, 70])
 
 
 class Sweeping(unittest.TestCase):
@@ -343,6 +476,27 @@ class RealEncoder(unittest.TestCase):
             pts = probe_first_pts(s._path(i), kind)
             self.assertAlmostEqual(pts, t.start(i) + reorder, delta=0.12, msg=f"segment {i} {kind}")
         self.assertIsNone(s.error)
+
+    def test_a_seek_back_that_catches_up_with_an_earlier_run_stops_quietly_and_cuts_nothing_short(self):
+        self.stream = s = self.out.make_stream()
+        fast = s.make_cmd
+        s.make_cmd = lambda i: (lambda c: c[:c.index("-r")] + ["-vf", "realtime=speed=8"] + c[c.index("-r"):])(fast(i))
+        s.begin(s.timeline.start(4))
+        s.wait_ready(1, 60)
+        time.sleep(0.3)                                    # the first run is part way into segment 5
+        self.assertIsNotNone(s.segment(2, 60))
+        self.assertEqual(s._run_start, 2)
+        deadline = time.monotonic() + 60
+        while s._proc.poll() is None and time.monotonic() < deadline:
+            s.status()
+            time.sleep(0.05)
+        time.sleep(0.3)
+        self.assertIsNone(s.error)                         # stopped by us at segment 4: not a failure
+        self.assertEqual(s._cursor, 4)
+        self.assertEqual(list(s.workdir.glob("*.tmp")), [])
+        for p in sorted(s.workdir.glob("seg*.ts")):        # every segment on disk is a whole one
+            length = float(engine.probe(p)["format"]["duration"])
+            self.assertAlmostEqual(length, s.timeline.seg_len, delta=0.15, msg=p.name)
 
     def test_a_movie_cast_from_the_middle_starts_there(self):
         self.stream = s = self.out.make_stream()
